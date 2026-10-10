@@ -71,7 +71,7 @@ def fetch_race(race_id: str):
     time.sleep(random.uniform(1.0, 2.0))
     
     html = None
-    target_url = ""
+    is_shutuba = False
     
     # ① まずは「未来の出馬表ページ (shutuba.html)」へのアクセスを試みる
     shutuba_url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
@@ -79,13 +79,13 @@ def fetch_race(race_id: str):
         res = requests.get(shutuba_url, headers=headers, timeout=10)
         res.raise_for_status()
         res.encoding = 'EUC-JP'
-        if "出馬表" in res.text or "馬名" in res.text:
+        if "umaban" in res.text or "HorseList" in res.text or "馬番" in res.text:
             html = res.text
-            target_url = shutuba_url
+            is_shutuba = True
     except Exception:
         pass
 
-    # ② もし出馬表で取得できなかった場合は、従来の「データベース（過去結果）」にフォールバック
+    # ② 出馬表で取得できなければ従来のデータベース（過去結果）へ
     if not html:
         db_url = f"https://db.netkeiba.com/race/{race_id}/"
         try:
@@ -93,7 +93,7 @@ def fetch_race(race_id: str):
             res.raise_for_status()
             res.encoding = 'euc-jp'
             html = res.text
-            target_url = db_url
+            is_shutuba = False
         except Exception as e:
             return {"status": "error", "message": f"データ取得に失敗しました: {str(e)}"}
 
@@ -101,115 +101,157 @@ def fetch_race(race_id: str):
         return {"status": "error", "message": "出馬表データが見つかりませんでした"}
 
     try:
-        title_match = re.search(r'<title>(.*?)</title>', html)
-        race_name = title_match.group(1).strip() if title_match else "レース不明"
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+
+        # レース名の取得
+        race_name_elem = soup.find('title')
+        race_name = race_name_elem.text.strip() if race_name_elem else "レース不明"
+        if "|" in race_name:
+            race_name = race_name.split("|")[0].strip()
 
         place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
         place_code = race_id[4:6] if len(race_id) >= 6 else '05'
         place_name = place_dict.get(place_code, "地方/海外")
 
-        tables = pd.read_html(StringIO(html))
-        target_df = None
-
-        for tb in tables:
-            cols = [str(c).replace('\n', '').replace(' ', '').strip() for c in tb.columns]
-            # 出馬表(shutuba)と過去結果(db)のどちらの列名パターンにも対応
-            if any('馬番' in c for c in cols) and any('馬名' in c for c in cols):
-                target_df = tb
-                break
-
-        if target_df is None or target_df.empty:
-            return {"status": "error", "message": "出馬表のテーブル構造が見つかりませんでした"}
-
-        # コース・距離・天候・馬場状態の抽出（簡易デフォルトフォールバック付き）
         track_type = "芝"
         distance = 2000
         weather = "晴"
         track_condition = "良"
 
-        match_track = re.search(r'(芝|ダ|障害)(?:専門)?(\d{3,4})m', html)
+        # コース・距離情報の抽出
+        text_content = soup.text
+        match_track = re.search(r'(芝|ダ|障害)(?:専門)?(\d{3,4})m', text_content)
         if match_track:
             track_type = match_track.group(1)
             distance = int(match_track.group(2))
 
-        match_weather = re.search(r'天候\s*:\s*([^\s/]+)', html)
-        if match_weather:
-            weather = match_weather.group(1)
-
-        match_cond = re.search(r'(?:馬場\s*:\s*|馬場状態\s*[:：])\s*([^\s/]+)', html)
-        if match_cond:
-            track_condition = match_cond.group(1)
-
         horses_data = []
-        
-        # pandasのDataFrameから行データを安全に抽出
-        for _, row in target_df.iterrows():
-            try:
-                row_str = " ".join([str(val) for val in row.values])
-                
-                # 馬番の抽出
-                umaban = 0
-                for val in row.values:
-                    try:
-                        v_int = int(str(val).strip())
-                        if 1 <= v_int <= 18:
-                            umaban = v_int
-                            break
-                    except ValueError:
+
+        if is_shutuba:
+            # === 未来の出馬表（shutuba.html）の解析 ===
+            # ネットケイバの出馬表は tr.HorseList で各馬の行が構成されています
+            horse_rows = soup.find_all('tr', class_=re.compile('HorseList'))
+            if not horse_rows:
+                # クラス名が異なる場合のフォールバック（テーブル内の行を探索）
+                horse_rows = soup.select('table.Shutuba_Table tr, .race_table_01 tr')
+
+            for row in horse_rows:
+                try:
+                    # 馬番
+                    umaban_elem = row.find('td', class_='Umaban') or row.find('td', class_='umaban')
+                    if not umaban_elem:
                         continue
-                if umaban == 0:
+                    umaban_txt = umaban_elem.text.strip()
+                    if not umaban_txt.isdigit():
+                        continue
+                    umaban = int(umaban_txt)
+
+                    # 馬名
+                    bamei_elem = row.find('td', class_='HorseInfo') or row.find('a', href=re.compile(r'/horse/'))
+                    bamei = bamei_elem.text.strip() if bamei_elem else f"馬番{umaban}"
+                    # 改行や余分な文字を削る
+                    bamei = re.sub(r'\s+', ' ', bamei).split(' ')[0]
+
+                    # 騎手
+                    kishu_elem = row.find('td', class_='Jockey') or row.find('a', href=re.compile(r'/jockey/'))
+                    kishu = kishu_elem.text.strip() if kishu_elem else "不明"
+                    kishu = re.sub(r'\s+', '', kishu)
+
+                    # オッズ
+                    odds = 10.0
+                    odds_elem = row.find('td', class_='Odds') or row.find('span', id=re.compile('odds'))
+                    if odds_elem:
+                        try:
+                            odds = float(odds_elem.text.strip())
+                        except ValueError:
+                            pass
+
+                    horses_data.append({
+                        "wakuban": 1,
+                        "umaban": umaban,
+                        "bamei": bamei,
+                        "kishu": kishu,
+                        "odds": odds,
+                        "kinryou": 55.0,
+                        "bataijuu": 480.0,
+                        "zenso_chakujun": 5,
+                        "avg_agari": 35.0,
+                        "kyakushitsu": 2,
+                        "shussou_kaisuu": 10
+                    })
+                except Exception:
                     continue
 
-                # 馬名の抽出（文字列長め、かつ数字ではないもの）
-                bamei = ""
-                for val in row.values:
-                    v_str = str(val).strip()
-                    if len(v_str) >= 2 and not v_str.isdigit() and 'netkeiba' not in v_str:
-                        # 雑多な情報が入っていないかチェック
-                        if not any(w in v_str for w in ['斤量', '馬体重', '調教師', '牡', '牝', '騸']):
-                            bamei = v_str
-                            break
-                if not bamei:
-                    bamei = f"馬番{umaban}"
-
-                # 騎手の抽出
-                kishu = "不明"
-                for val in row.values:
-                    v_str = str(val).strip()
-                    # 一般的な日本の騎手名やアルファベット等
-                    if len(v_str) >= 2 and v_str not in bamei and not v_str.isdigit():
-                        if any(k in v_str for k in ['騎手', '川田', 'ルメール', '武豊', '横山', '戸崎', '坂井', '松山', '岩田', '西村', '鮫島', '幸', '浜中', '田辺', '津村', '菅原', '丹内', '荻野', '永島', '古川', '斎藤', '角田', '小林', '泉谷', '秋山', '富田', '原', '大野', '江田', '柴田', '石川', '北村', '丸田', '吉田', 'モレイラ', 'レーン', 'マーカ', 'デムーロ']):
-                            kishu = v_str.replace('[地方]', '').strip()
-                            break
-
-                # オッズの抽出
-                odds = 10.0
-                for val in row.values:
+        # もし出馬表の独自解析で取れなかった場合、あるいは過去結果ページだった場合
+        if not horses_data:
+            tables = pd.read_html(StringIO(html))
+            target_df = None
+            for tb in tables:
+                cols = [str(c).replace('\n', '').replace(' ', '').strip() for c in tb.columns]
+                if any('馬番' in c for c in cols) and any('馬名' in c for c in cols):
+                    target_df = tb
+                    break
+            
+            if target_df is not None and not target_df.empty:
+                for _, row in target_df.iterrows():
                     try:
-                        v_float = float(str(val).strip())
-                        if 1.1 <= v_float <= 999.9:
-                            odds = v_float
-                            break
-                    except ValueError:
+                        umaban = 0
+                        for val in row.values:
+                            try:
+                                v_int = int(str(val).strip())
+                                if 1 <= v_int <= 18:
+                                    umaban = v_int
+                                    break
+                            except ValueError:
+                                continue
+                        if umaban == 0:
+                            continue
+
+                        bamei = ""
+                        for val in row.values:
+                            v_str = str(val).strip()
+                            if len(v_str) >= 2 and not v_str.isdigit() and 'netkeiba' not in v_str:
+                                if not any(w in v_str for w in ['斤量', '馬体重', '調教師', '牡', '牝', '騸']):
+                                    bamei = v_str
+                                    break
+                        if not bamei:
+                            bamei = f"馬番{umaban}"
+
+                        kishu = "不明"
+                        for val in row.values:
+                            v_str = str(val).strip()
+                            if len(v_str) >= 2 and v_str not in bamei and not v_str.isdigit():
+                                if any(k in v_str for k in ['騎手', '川田', 'ルメール', '武豊', '横山', '戸崎', '坂井', '松山', '岩田', '西村', '鮫島', '幸', '浜中', '田辺', '津村', '菅原', '丹内', '荻野', '永島', '古川', '斎藤', '角田', '小林', '泉谷', '秋山', '富田', '原', '大野', '江田', '柴田', '石川', '北村', '丸田', '吉田', 'モレイラ', 'レーン', 'マーカ', 'デムーロ']):
+                                    kishu = v_str.replace('[地方]', '').strip()
+                                    break
+
+                        odds = 10.0
+                        for val in row.values:
+                            try:
+                                v_float = float(str(val).strip())
+                                if 1.1 <= v_float <= 999.9:
+                                    odds = v_float
+                                    break
+                            except ValueError:
+                                continue
+
+                        horses_data.append({
+                            "wakuban": 1,
+                            "umaban": umaban,
+                            "bamei": bamei,
+                            "kishu": kishu,
+                            "odds": odds,
+                            "kinryou": 55.0,
+                            "bataijuu": 480.0,
+                            "zenso_chakujun": 5,
+                            "avg_agari": 35.0,
+                            "kyakushitsu": 2,
+                            "shussou_kaisuu": 10
+                        })
+                    except Exception:
                         continue
 
-                horses_data.append({
-                    "wakuban": 1,
-                    "umaban": umaban,
-                    "bamei": bamei,
-                    "kishu": kishu,
-                    "odds": odds,
-                    "kinryou": 55.0,
-                    "bataijuu": 480.0,
-                    "zenso_chakujun": 5,
-                    "avg_agari": 35.0,
-                    "kyakushitsu": 2,
-                    "shussou_kaisuu": 10
-                })
-            except Exception:
-                continue
-
-        # もしうまく行から抜け出せなかった場合の安全策
         if not horses_data:
             return {"status": "error", "message": "出馬表の馬データを正しく解析できませんでした"}
 
