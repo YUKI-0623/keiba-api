@@ -261,7 +261,9 @@ def fetch_race(race_id: str):
         }
 
     except Exception as e:
-        return {"status": "error", "message": f"パース処理エラー: {str(e)}"}def apply_track_bias(prediction, horse, track_bias):
+        return {"status": "error", "message": f"パース処理エラー: {str(e)}"}
+        
+    def apply_track_bias(prediction, horse, track_bias):
     """ トラックバイアスに基づいてAIスコアにボーナス/ペナルティを加算 """
     bias_bonus = 0.0
     kyaku = horse.kyakushitsu
