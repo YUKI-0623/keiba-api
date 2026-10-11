@@ -65,6 +65,9 @@ class RaceRequest(BaseModel):
     expected_pace: str = "M"
     track_bias: str = "フラット" # ▼ 追加：トラックバイアス
 
+# =========================================================
+# ① 出馬表データ取得API（タイムアウト＆未来/過去両対応 完璧版）
+# =========================================================
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
     # Bot弾きを回避するため、よりブラウザに近いヘッダーを設定
@@ -77,9 +80,7 @@ def fetch_race(race_id: str):
     html = None
     is_shutuba = False
     
-    # =========================================================
     # 💡 確実なデータ取得のための「Wait ＆ リトライ」専用関数
-    # =========================================================
     def fetch_with_retry(url, max_retries=3):
         for attempt in range(max_retries):
             # 毎回確実に2〜4秒のWait（待機）を入れてサーバー負荷とBot判定を回避
@@ -262,8 +263,12 @@ def fetch_race(race_id: str):
 
     except Exception as e:
         return {"status": "error", "message": f"パース処理エラー: {str(e)}"}
-        
-    def apply_track_bias(prediction, horse, track_bias):
+
+
+# =========================================================
+# ② AI予測＆トラックバイアス適用API（ご自身の精巧なロジック）
+# =========================================================
+def apply_track_bias(prediction, horse, track_bias):
     """ トラックバイアスに基づいてAIスコアにボーナス/ペナルティを加算 """
     bias_bonus = 0.0
     kyaku = horse.kyakushitsu
