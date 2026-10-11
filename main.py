@@ -66,7 +66,7 @@ class RaceRequest(BaseModel):
     track_bias: str = "フラット"
 
 # =========================================================
-# ① 出馬表データ取得API（文字化け自動判定 完璧版）
+# ① 出馬表データ取得API（過去データから脚質自動判定 追加版）
 # =========================================================
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
@@ -79,27 +79,52 @@ def fetch_race(race_id: str):
     html = None
     is_shutuba = False
     
-    # 💡 確実なデータ取得＆【文字化け防止】専用関数
+    # 💡 確実なデータ取得＆文字化け防止
     def fetch_with_retry(url, max_retries=3):
         for attempt in range(max_retries):
             time.sleep(random.uniform(2.0, 4.0)) 
             try:
                 res = requests.get(url, headers=headers, timeout=15)
                 res.raise_for_status()
-                
-                # ▼▼ 文字化けを完全に防ぐための自動判定 ▼▼
-                # netkeibaはページによってEUC-JPとUTF-8が混在しているため、
-                # Pythonに中身を読んで最適な文字コードを自動判定させます。
                 res.encoding = res.apparent_encoding
                 return res.text
-            
             except Exception as e:
                 if attempt == max_retries - 1:
                     print(f"Error fetching {url}: {e}")
                     return None
         return None
 
-    # 【ロジック1】まずは未来の出馬表ページ (shutuba.html) へアクセス
+    # === 💡 追加：過去の戦績から「基本脚質」を自動判定するAI関数 ===
+    def get_auto_kyakushitsu(bamei_str):
+        try:
+            records = horse_history_db.get(bamei_str, {}).get('race_records', [])
+            if not records:
+                return 2.0  # データがなければデフォルトで先行(2)
+
+            last_corners = []
+            # 過去5走の「最後のコーナー(4角)の通過順位」を抽出
+            for r in records[-5:]:
+                passing = r.get('passing', '')
+                if passing and passing != '-':
+                    parts = str(passing).split('-')
+                    try:
+                        last_corners.append(int(parts[-1]))
+                    except ValueError:
+                        pass
+            
+            if not last_corners:
+                return 2.0
+
+            # 4コーナーの平均位置から脚質を判定
+            avg_pos = np.mean(last_corners)
+            if avg_pos <= 2.5: return 1.0    # 逃げ
+            elif avg_pos <= 6.5: return 2.0  # 先行
+            elif avg_pos <= 10.5: return 3.0 # 差し
+            else: return 4.0                 # 追込
+        except Exception:
+            return 2.0
+
+    # 【ロジック1】未来の出馬表ページ (shutuba.html)
     shutuba_url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
     shutuba_text = fetch_with_retry(shutuba_url)
     
@@ -107,7 +132,7 @@ def fetch_race(race_id: str):
         html = shutuba_text
         is_shutuba = True
 
-    # 【ロジック2】出馬表が無い（過去レース）場合は、データベース（db.netkeiba）へ自動切替
+    # 【ロジック2】過去のデータベース (db.netkeiba.com)
     if not is_shutuba:
         db_url = f"https://db.netkeiba.com/race/{race_id}/"
         db_text = fetch_with_retry(db_url)
@@ -181,7 +206,9 @@ def fetch_race(race_id: str):
                     horses_data.append({
                         "wakuban": 1, "umaban": umaban, "bamei": bamei, "kishu": kishu,
                         "odds": odds, "kinryou": 55.0, "bataijuu": 480.0,
-                        "zenso_chakujun": 5, "avg_agari": 35.0, "kyakushitsu": 2, "shussou_kaisuu": 10
+                        "zenso_chakujun": 5, "avg_agari": 35.0,
+                        "kyakushitsu": get_auto_kyakushitsu(bamei), # 💡 ここで自動判定！
+                        "shussou_kaisuu": 10
                     })
                 except Exception:
                     continue
@@ -235,7 +262,9 @@ def fetch_race(race_id: str):
                             horses_data.append({
                                 "wakuban": 1, "umaban": umaban, "bamei": bamei, "kishu": kishu,
                                 "odds": odds, "kinryou": 55.0, "bataijuu": 480.0,
-                                "zenso_chakujun": 5, "avg_agari": 35.0, "kyakushitsu": 2, "shussou_kaisuu": 10
+                                "zenso_chakujun": 5, "avg_agari": 35.0,
+                                "kyakushitsu": get_auto_kyakushitsu(bamei), # 💡 ここでも自動判定！
+                                "shussou_kaisuu": 10
                             })
                         except Exception:
                             continue
