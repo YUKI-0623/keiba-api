@@ -63,14 +63,13 @@ class RaceRequest(BaseModel):
     weather: str
     track_condition: str
     expected_pace: str = "M"
-    track_bias: str = "フラット" # ▼ 追加：トラックバイアス
+    track_bias: str = "フラット"
 
 # =========================================================
-# ① 出馬表データ取得API（タイムアウト＆未来/過去両対応 完璧版）
+# ① 出馬表データ取得API（文字化け自動判定 完璧版）
 # =========================================================
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
-    # Bot弾きを回避するため、よりブラウザに近いヘッダーを設定
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -80,16 +79,20 @@ def fetch_race(race_id: str):
     html = None
     is_shutuba = False
     
-    # 💡 確実なデータ取得のための「Wait ＆ リトライ」専用関数
+    # 💡 確実なデータ取得＆【文字化け防止】専用関数
     def fetch_with_retry(url, max_retries=3):
         for attempt in range(max_retries):
-            # 毎回確実に2〜4秒のWait（待機）を入れてサーバー負荷とBot判定を回避
             time.sleep(random.uniform(2.0, 4.0)) 
             try:
                 res = requests.get(url, headers=headers, timeout=15)
                 res.raise_for_status()
-                res.encoding = 'EUC-JP'
+                
+                # ▼▼ 文字化けを完全に防ぐための自動判定 ▼▼
+                # netkeibaはページによってEUC-JPとUTF-8が混在しているため、
+                # Pythonに中身を読んで最適な文字コードを自動判定させます。
+                res.encoding = res.apparent_encoding
                 return res.text
+            
             except Exception as e:
                 if attempt == max_retries - 1:
                     print(f"Error fetching {url}: {e}")
@@ -117,7 +120,6 @@ def fetch_race(race_id: str):
         return {"status": "error", "message": "出馬表データが見つかりませんでした"}
 
     try:
-        # レース名などの共通情報取得
         title_match = re.search(r'<title>(.*?)</title>', html)
         race_name = title_match.group(1).strip() if title_match else "レース不明"
         if "|" in race_name:
@@ -135,16 +137,14 @@ def fetch_race(race_id: str):
 
         horses_data = []
 
-        # === 【抽出パターンA】未来の出馬表専用（正規表現のみで抽出） ===
+        # === 【抽出パターンA】未来の出馬表専用 ===
         if is_shutuba:
             horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
-            # 構造が違う場合への備え
             if not horse_blocks:
                 horse_blocks = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
                 
             for block in horse_blocks:
                 try:
-                    # 馬番
                     umaban = 0
                     u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban|umaban)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
                     if u_m:
@@ -152,7 +152,6 @@ def fetch_race(race_id: str):
                         if u_str.isdigit(): umaban = int(u_str)
                     if umaban == 0: continue
                     
-                    # 馬名
                     bamei = f"馬番{umaban}"
                     b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
                     if not b_m:
@@ -161,7 +160,6 @@ def fetch_race(race_id: str):
                         b_str = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
                         if b_str: bamei = b_str
 
-                    # 騎手
                     kishu = "不明"
                     k_m = re.search(r'<td[^>]*class="[^"]*Jockey[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
                     if not k_m:
@@ -171,7 +169,6 @@ def fetch_race(race_id: str):
                         k_str = re.sub(r'[\r\n\t\s]+', '', k_str)
                         if k_str: kishu = k_str
 
-                    # オッズ
                     odds = 10.0
                     o_m = re.search(r'<span[^>]*id="odds[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
                     if not o_m:
@@ -189,7 +186,7 @@ def fetch_race(race_id: str):
                 except Exception:
                     continue
 
-        # === 【抽出パターンB】過去のDBページ、または解析漏れ時のPandasフォールバック ===
+        # === 【抽出パターンB】過去DBページ等のPandasフォールバック ===
         if not horses_data:
             tables = pd.read_html(StringIO(html))
             for tb in tables:
@@ -247,7 +244,6 @@ def fetch_race(race_id: str):
         if not horses_data:
             return {"status": "error", "message": "出馬表の馬データを正しく解析できませんでした"}
 
-        # 馬番順に綺麗に並び替え
         horses_data = sorted(horses_data, key=lambda x: x['umaban'])
 
         return {
