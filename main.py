@@ -67,40 +67,56 @@ class RaceRequest(BaseModel):
 
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
-    time.sleep(random.uniform(1.0, 2.0))
+    # Bot弾きを回避するため、よりブラウザに近いヘッダーを設定
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'ja,en-US;q=0.7,en;q=0.3'
+    }
     
     html = None
     is_shutuba = False
     
-    # ① まずは未来の出馬表ページ (shutuba.html) を取得しに行く
-    shutuba_url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
-    try:
-        res = requests.get(shutuba_url, headers=headers, timeout=10)
-        res.raise_for_status()
-        res.encoding = 'EUC-JP'
-        if "HorseList" in res.text or "umaban" in res.text or "馬番" in res.text:
-            html = res.text
-            is_shutuba = True
-    except Exception:
-        pass
+    # =========================================================
+    # 💡 確実なデータ取得のための「Wait ＆ リトライ」専用関数
+    # =========================================================
+    def fetch_with_retry(url, max_retries=3):
+        for attempt in range(max_retries):
+            # 毎回確実に2〜4秒のWait（待機）を入れてサーバー負荷とBot判定を回避
+            time.sleep(random.uniform(2.0, 4.0)) 
+            try:
+                res = requests.get(url, headers=headers, timeout=15)
+                res.raise_for_status()
+                res.encoding = 'EUC-JP'
+                return res.text
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Error fetching {url}: {e}")
+                    return None
+        return None
 
-    # ② 失敗した場合は過去のデータベースへ
-    if not html:
+    # 【ロジック1】まずは未来の出馬表ページ (shutuba.html) へアクセス
+    shutuba_url = f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}"
+    shutuba_text = fetch_with_retry(shutuba_url)
+    
+    if shutuba_text and ("HorseList" in shutuba_text or "Umaban" in shutuba_text or "馬番" in shutuba_text):
+        html = shutuba_text
+        is_shutuba = True
+
+    # 【ロジック2】出馬表が無い（過去レース）場合は、データベース（db.netkeiba）へ自動切替
+    if not is_shutuba:
         db_url = f"https://db.netkeiba.com/race/{race_id}/"
-        try:
-            res = requests.get(db_url, headers=headers, timeout=10)
-            res.raise_for_status()
-            res.encoding = 'euc-jp'
-            html = res.text
-            is_shutuba = False
-        except Exception as e:
-            return {"status": "error", "message": f"データ取得に失敗しました: {str(e)}"}
+        db_text = fetch_with_retry(db_url)
+        if db_text:
+            html = db_text
+        else:
+            return {"status": "error", "message": "データ通信エラー: 時間をおいて再度お試しください。"}
 
     if not html:
         return {"status": "error", "message": "出馬表データが見つかりませんでした"}
 
     try:
+        # レース名などの共通情報取得
         title_match = re.search(r'<title>(.*?)</title>', html)
         race_name = title_match.group(1).strip() if title_match else "レース不明"
         if "|" in race_name:
@@ -110,11 +126,7 @@ def fetch_race(race_id: str):
         place_code = race_id[4:6] if len(race_id) >= 6 else '05'
         place_name = place_dict.get(place_code, "地方/海外")
 
-        track_type = "芝"
-        distance = 2000
-        weather = "晴"
-        track_condition = "良"
-
+        track_type, distance, weather, track_condition = "芝", 2000, "晴", "良"
         match_track = re.search(r'(芝|ダ|障害)(?:専門)?(\d{3,4})m', html)
         if match_track:
             track_type = match_track.group(1)
@@ -122,132 +134,120 @@ def fetch_race(race_id: str):
 
         horses_data = []
 
+        # === 【抽出パターンA】未来の出馬表専用（正規表現のみで抽出） ===
         if is_shutuba:
-            # === 未来の出馬表ページ専用の安全なテキスト/正規表現抽出 ===
-            # HTMLタグを大まかに分解して馬番、馬名、騎手を安全に拾う
-            # ネットケイバの出馬表行を探索
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, 'html.parser')
-            
-            # 各馬の行ブロックを探す
-            rows = soup.find_all('tr', class_=re.compile('HorseList'))
-            if not rows:
-                rows = soup.select('table.Shutuba_Table tr, .race_table_01 tr, tr')
-
-            for row in rows:
-                row_text = row.get_text(separator=" ")
-                # 数字（馬番）が含まれているかチェック
-                match_umaban = re.search(r'\b([1-9]|1[0-8])\b', row.get_text())
+            horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
+            # 構造が違う場合への備え
+            if not horse_blocks:
+                horse_blocks = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
                 
-                # 馬名らしき文字列や騎手名を探すための簡易チェック
-                if "馬番" in row_text or "枠番" in row_text or len(row.find_all('td')) < 4:
-                    continue
-                
-                tds = [td.get_text(strip=True) for td in row.find_all('td')]
-                if len(tds) >= 5:
-                    # 馬番を探す
+            for block in horse_blocks:
+                try:
+                    # 馬番
                     umaban = 0
-                    for t in tds[:3]:
-                        if t.isdigit() and 1 <= int(t) <= 18:
-                            umaban = int(t)
-                            break
-                    if umaban == 0:
-                        continue
+                    u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban|umaban)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
+                    if u_m:
+                        u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
+                        if u_str.isdigit(): umaban = int(u_str)
+                    if umaban == 0: continue
+                    
+                    # 馬名
+                    bamei = f"馬番{umaban}"
+                    b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
+                    if not b_m:
+                        b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
+                    if b_m:
+                        b_str = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
+                        if b_str: bamei = b_str
 
-                    # 馬名を探す（2文字以上で数字以外のもの）
-                    bamei = ""
-                    for t in tds:
-                        if len(t) >= 2 and not t.isdigit() and 'netkeiba' not in t:
-                            if not any(w in t for w in ['斤量', '馬体重', '調教師', '牡', '牝', '騸', '父', '母', '歳', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9']):
-                                bamei = t
-                                break
-                    if not bamei:
-                        bamei = f"馬番{umaban}"
-
-                    # 騎手を探す
+                    # 騎手
                     kishu = "不明"
-                    for t in tds:
-                        if any(k in t for k in ['川田', 'ルメール', '武豊', '横山', '戸崎', '坂井', '松山', '岩田', '西村', '鮫島', '幸', '浜中', '田辺', '津村', '菅原', '丹内', '荻野', '永島', '古川', '斎藤', '角田', '小林', '泉谷', '秋山', '富田', '原', '大野', '江田', '柴田', '石川', '北村', '丸田', '吉田', 'モレイラ', 'レーン', 'マーカ', 'デムーロ', '騎手']):
-                            kishu = t.replace('[地方]', '').replace('騎手', '').strip()
-                            break
+                    k_m = re.search(r'<td[^>]*class="[^"]*Jockey[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
+                    if not k_m:
+                        k_m = re.search(r'<a[^>]*href="[^"]*jockey/\d+[^"]*"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
+                    if k_m:
+                        k_str = re.sub(r'<[^>]*>', '', k_m.group(1)).strip()
+                        k_str = re.sub(r'[\r\n\t\s]+', '', k_str)
+                        if k_str: kishu = k_str
 
-                    # 既に追加済みの馬番でなければ追加
-                    if not any(h['umaban'] == umaban for h in horses_data):
-                        horses_data.append({
-                            "wakuban": 1,
-                            "umaban": umaban,
-                            "bamei": bamei,
-                            "kishu": kishu,
-                            "odds": 10.0,
-                            "kinryou": 55.0,
-                            "bataijuu": 480.0,
-                            "zenso_chakujun": 5,
-                            "avg_agari": 35.0,
-                            "kyakushitsu": 2,
-                            "shussou_kaisuu": 10
-                        })
+                    # オッズ
+                    odds = 10.0
+                    o_m = re.search(r'<span[^>]*id="odds[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
+                    if not o_m:
+                        o_m = re.search(r'<td[^>]*class="[^"]*Txt_R[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
+                    if o_m:
+                        o_str = re.sub(r'<[^>]*>', '', o_m.group(1)).strip()
+                        try: odds = float(o_str)
+                        except: pass
 
-        # もし出馬表からの抽出で0頭だった場合、または過去結果ページだった場合のフォールバック
+                    horses_data.append({
+                        "wakuban": 1, "umaban": umaban, "bamei": bamei, "kishu": kishu,
+                        "odds": odds, "kinryou": 55.0, "bataijuu": 480.0,
+                        "zenso_chakujun": 5, "avg_agari": 35.0, "kyakushitsu": 2, "shussou_kaisuu": 10
+                    })
+                except Exception:
+                    continue
+
+        # === 【抽出パターンB】過去のDBページ、または解析漏れ時のPandasフォールバック ===
         if not horses_data:
             tables = pd.read_html(StringIO(html))
-            target_df = None
             for tb in tables:
                 cols = [str(c).replace('\n', '').replace(' ', '').strip() for c in tb.columns]
-                if any('馬番' in c for c in cols) or any('馬名' in c for c in cols):
-                    target_df = tb
-                    break
-            
-            if target_df is not None and not target_df.empty:
-                for _, row in target_df.iterrows():
-                    try:
-                        umaban = 0
-                        for val in row.values:
-                            try:
-                                v_int = int(str(val).strip())
-                                if 1 <= v_int <= 18:
-                                    umaban = v_int
-                                    break
-                            except ValueError:
-                                continue
-                        if umaban == 0:
+                if any('馬番' in c for c in cols) and any('馬名' in c for c in cols):
+                    for _, row in tb.iterrows():
+                        try:
+                            umaban = 0
+                            for val in row.values:
+                                try:
+                                    v_int = int(str(val).strip())
+                                    if 1 <= v_int <= 18:
+                                        umaban = v_int
+                                        break
+                                except ValueError:
+                                    continue
+                            if umaban == 0: continue
+
+                            bamei = ""
+                            for val in row.values:
+                                v_str = str(val).strip()
+                                if len(v_str) >= 2 and not v_str.isdigit() and 'netkeiba' not in v_str:
+                                    if not any(w in v_str for w in ['斤量', '馬体重', '調教師', '牡', '牝', '騸']):
+                                        bamei = v_str
+                                        break
+                            if not bamei: bamei = f"馬番{umaban}"
+
+                            kishu = "不明"
+                            for val in row.values:
+                                v_str = str(val).strip()
+                                if len(v_str) >= 2 and v_str not in bamei and not v_str.isdigit():
+                                    if any(k in v_str for k in ['川田', 'ルメール', '武豊', '横山', '戸崎', '坂井', '松山', '岩田', '西村', '鮫島', '幸', '浜中', '田辺', '津村', '菅原', '丹内', '荻野', '永島', '古川', '斎藤', '角田', '小林', '泉谷', '秋山', '富田', '原', '大野', '江田', '柴田', '石川', '北村', '丸田', '吉田', 'モレイラ', 'レーン', 'マーカ', 'デムーロ']):
+                                        kishu = v_str.replace('[地方]', '').strip()
+                                        break
+
+                            odds = 10.0
+                            for val in row.values:
+                                try:
+                                    v_float = float(str(val).strip())
+                                    if 1.1 <= v_float <= 999.9:
+                                        odds = v_float
+                                        break
+                                except ValueError:
+                                    continue
+
+                            horses_data.append({
+                                "wakuban": 1, "umaban": umaban, "bamei": bamei, "kishu": kishu,
+                                "odds": odds, "kinryou": 55.0, "bataijuu": 480.0,
+                                "zenso_chakujun": 5, "avg_agari": 35.0, "kyakushitsu": 2, "shussou_kaisuu": 10
+                            })
+                        except Exception:
                             continue
-
-                        bamei = ""
-                        for val in row.values:
-                            v_str = str(val).strip()
-                            if len(v_str) >= 2 and not v_str.isdigit() and 'netkeiba' not in v_str:
-                                if not any(w in v_str for w in ['斤量', '馬体重', '調教師', '牡', '牝', '騸']):
-                                    bamei = v_str
-                                    break
-                        if not bamei:
-                            bamei = f"馬番{umaban}"
-
-                        kishu = "不明"
-                        for val in row.values:
-                            v_str = str(val).strip()
-                            if len(v_str) >= 2 and v_str not in bamei and not v_str.isdigit():
-                                if any(k in v_str for k in ['川田', 'ルメール', '武豊', '横山', '戸崎', '坂井', '松山', '岩田', '西村', '鮫島', '幸', '浜中', '田辺', '津村', '菅原', '丹内', '荻野', '永島', '古川', '斎藤', '角田', '小林', '泉谷', '秋山', '富田', '原', '大野', '江田', '柴田', '石川', '北村', '丸田', '吉田', 'モレイラ', 'レーン', 'マーカ', 'デムーロ']):
-                                    kishu = v_str.replace('[地方]', '').strip()
-                                    break
-
-                        horses_data.append({
-                            "wakuban": 1,
-                            "umaban": umaban,
-                            "bamei": bamei,
-                            "kishu": kishu,
-                            "odds": 10.0,
-                            "kinryou": 55.0,
-                            "bataijuu": 480.0,
-                            "zenso_chakujun": 5,
-                            "avg_agari": 35.0,
-                            "kyakushitsu": 2,
-                            "shussou_kaisuu": 10
-                        })
-                    except Exception:
-                        continue
+                    break
 
         if not horses_data:
             return {"status": "error", "message": "出馬表の馬データを正しく解析できませんでした"}
+
+        # 馬番順に綺麗に並び替え
+        horses_data = sorted(horses_data, key=lambda x: x['umaban'])
 
         return {
             "status": "success",
@@ -261,8 +261,7 @@ def fetch_race(race_id: str):
         }
 
     except Exception as e:
-        return {"status": "error", "message": f"パース処理エラー: {str(e)}"}
-def apply_track_bias(prediction, horse, track_bias):
+        return {"status": "error", "message": f"パース処理エラー: {str(e)}"}def apply_track_bias(prediction, horse, track_bias):
     """ トラックバイアスに基づいてAIスコアにボーナス/ペナルティを加算 """
     bias_bonus = 0.0
     kyaku = horse.kyakushitsu
