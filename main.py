@@ -13,7 +13,7 @@ import random
 import pickle
 import math
 
-app = FastAPI(title="競馬シミュレーションAPI (実力・期待値収束＆PCI対応版)")
+app = FastAPI(title="競馬シミュレーションAPI (5大展開シナリオ＆実力収束版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +43,7 @@ def safe_encode(encoder_name, value):
     return 0
 
 # =========================================================
-# 💡 PCI・RPCI ＆ 馬の実力値 計算用ヘルパー関数群
+# 💡 PCI・RPCI ＆ 馬の実力値・マクリ性能 計算ヘルパー関数群
 # =========================================================
 def parse_time_to_seconds(time_val):
     if time_val is None or time_val == '-' or time_val == '':
@@ -114,20 +114,20 @@ def get_horse_pci_stats(bamei_str):
     return avg_pci, get_pci_label(avg_pci)
 
 def get_horse_real_stats(bamei_str):
-    """ 過去DBから馬の実際の『前走着順』『近3走平均上がり』『出走回数』『地力スコア』を抽出 """
+    """ 過去DBから『前走着順』『近3走平均上がり』『出走回数』『地力スコア』『マクリ性能』を抽出 """
     records = horse_history_db.get(bamei_str, {}).get('race_records', [])
     if not records:
-        return 8.0, 35.0, 0, 0.5
+        return 8.0, 35.0, 0, 0.5, False
 
     shussou_kaisuu = len(records)
 
-    # 1. 前走着順の取得
+    # 1. 前走着順
     try:
         zenso_chakujun = float(records[-1].get('rank', 8.0))
     except:
         zenso_chakujun = 8.0
 
-    # 2. 近3走の平均上がり3Fの取得
+    # 2. 近3走の平均上がり3F
     up_list = []
     for r in records[-3:]:
         try:
@@ -138,14 +138,25 @@ def get_horse_real_stats(bamei_str):
             pass
     avg_agari = round(float(np.mean(up_list)), 2) if up_list else 35.0
 
-    # 3. 直近5走の着順から「地力（馬の基礎的な強さ）」を0.0〜1.0で評価
+    # 3. 直近5走の重み付き地力スコア (0.1〜1.0) & 道中押し上げ（マクリ）実績判定
     recent_ranks = []
+    makuri_flag = False
     for r in records[-5:]:
         try:
             rk = float(r.get('rank', 10.0))
             recent_ranks.append(min(18.0, max(1.0, rk)))
         except:
             pass
+        # 通過順(例: "10-9-5-3")から道中で3頭以上ポジションを押し上げた実績があるかチェック
+        passing = str(r.get('passing', ''))
+        if '-' in passing:
+            try:
+                p_nums = [int(x) for x in passing.split('-') if x.isdigit()]
+                if len(p_nums) >= 2 and (p_nums[0] - p_nums[-1]) >= 3:
+                    makuri_flag = True
+            except:
+                pass
+
     if recent_ranks:
         weights = np.arange(1, len(recent_ranks) + 1)
         weighted_avg_rank = np.average(recent_ranks, weights=weights)
@@ -153,9 +164,10 @@ def get_horse_real_stats(bamei_str):
     else:
         power_score = 0.5
 
-    return zenso_chakujun, avg_agari, shussou_kaisuu, power_score
+    return zenso_chakujun, avg_agari, shussou_kaisuu, power_score, makuri_flag
 
 def get_course_rpci_stats(course_key):
+    """ コースの過去平均ペースからRPCIと推奨詳細ペース(5段階)を算出 """
     c_stats = course_history_db.get(course_key, {})
     pace_f = c_stats.get('pace_first', [])
     pace_l = c_stats.get('pace_last', [])
@@ -166,14 +178,32 @@ def get_course_rpci_stats(course_key):
     rpci = round((avg_pace_f / avg_pace_l) * 50.0, 1) if avg_pace_l > 0 else 50.0
     rpci_type = get_pci_label(rpci)
 
-    if rpci_type == "A":
-        rec_pace = "H"
-    elif rpci_type == "C":
-        rec_pace = "S"
+    # RPCIの値に応じて5つの詳細シナリオを自動推奨
+    if rpci < 48.0:
+        rec_pace = "H_MAEKUZURE"  # ハイペース: ①前崩れのバテ合い消耗戦
+    elif rpci < 49.8:
+        rec_pace = "M_LONSPA"     # ミドルペース: ②ロンスパ戦
+    elif rpci <= 52.0:
+        rec_pace = "M_JIRIKI"     # ミドルペース: ①地力・総合力勝負
+    elif rpci <= 53.2:
+        rec_pace = "S_LONSPA"     # スローペース: ②ロンスパ・マクリ
     else:
-        rec_pace = "M"
+        rec_pace = "S_YOIDON"     # スローペース: ①直線ヨーイドン
 
     return rpci, rpci_type, rec_pace
+
+def adjust_pace_times(expected_pace, avg_pace_f, avg_pace_l, avg_req_up):
+    """ 選択された5つの展開シナリオに応じて前半・後半・要求上がりタイムを補正 """
+    if expected_pace in ["S_YOIDON", "S"]:
+        return avg_pace_f + 1.4, avg_pace_l - 1.4, avg_req_up - 1.0
+    elif expected_pace == "S_LONSPA":
+        return avg_pace_f + 0.8, avg_pace_l - 0.8, avg_req_up - 0.4
+    elif expected_pace == "M_LONSPA":
+        return avg_pace_f - 0.4, avg_pace_l + 0.4, avg_req_up + 0.3
+    elif expected_pace in ["H_MAEKUZURE", "H"]:
+        return avg_pace_f - 1.4, avg_pace_l + 1.4, avg_req_up + 1.0
+    else:  # M_JIRIKI or M
+        return avg_pace_f, avg_pace_l, avg_req_up
 
 class HorseData(BaseModel):
     wakuban: float
@@ -197,11 +227,11 @@ class RaceRequest(BaseModel):
     distance: int
     weather: str
     track_condition: str
-    expected_pace: str = "M"
+    expected_pace: str = "M_JIRIKI"
     track_bias: str = "フラット"
 
 # =========================================================
-# ① 出馬表データ取得API（実力データ自動紐付け版）
+# ① 出馬表データ取得API
 # =========================================================
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
@@ -329,7 +359,7 @@ def fetch_race(race_id: str):
                         except: pass
 
                     h_pci, h_pci_type = get_horse_pci_stats(bamei)
-                    zenso, agari, kaisuu, _ = get_horse_real_stats(bamei)
+                    zenso, agari, kaisuu, _, _ = get_horse_real_stats(bamei)
 
                     horses_data.append({
                         "wakuban": min(8, math.ceil(umaban / 2)),
@@ -390,7 +420,7 @@ def fetch_race(race_id: str):
                                     continue
 
                             h_pci, h_pci_type = get_horse_pci_stats(bamei)
-                            zenso, agari, kaisuu, _ = get_horse_real_stats(bamei)
+                            zenso, agari, kaisuu, _, _ = get_horse_real_stats(bamei)
 
                             horses_data.append({
                                 "wakuban": min(8, math.ceil(umaban / 2)),
@@ -433,27 +463,104 @@ def fetch_race(race_id: str):
 
 
 # =========================================================
-# ② 基礎能力 ＆ 展開・PCI補正の総合計算エンジン
+# ② 5大展開シナリオ × 基礎能力・PCI・脚質 総合計算エンジン
 # =========================================================
-def calculate_comprehensive_score(raw_lgb_pred, horse, power_score, h_pci_type, expected_pace, track_bias):
+def calculate_comprehensive_score(raw_lgb_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, expected_pace, track_bias):
     """
-    AIの基礎予測値、過去着順の地力、市場評価(オッズ)を統合し、
-    馬の本来の強さをしっかりと反映させた上で展開・PCI補正を倍率で適用する
+    選択された5つの展開シナリオに応じて、馬の基礎能力・脚質・PCI・上がり性能・マクリ適性を緻密に評価する
     """
-    # 1. オッズから逆算される市場の基礎支持率（極端な能力乖離を防ぐアンカー）
     if horse.odds > 1.0:
         market_prob = min(0.55, 0.80 / float(horse.odds))
     else:
         market_prob = 0.08
 
-    # 2. 馬の基礎能力スコアの統合 (LightGBM予測 + 過去着順の地力 + 市場評価のブレンド)
-    base_ability = (raw_lgb_pred * 0.50) + (power_score * 0.30) + (market_prob * 0.20)
+    # ミドル①「地力・総合力勝負」の時は過去実績(power_score)の比重をさらに高める
+    if expected_pace in ["M_JIRIKI", "M"]:
+        base_ability = (raw_lgb_pred * 0.45) + (power_score * 0.35) + (market_prob * 0.20)
+    else:
+        base_ability = (raw_lgb_pred * 0.50) + (power_score * 0.30) + (market_prob * 0.20)
 
-    # 3. トラックバイアス補正（基礎能力を土台とした倍率方式：最大±12%程度）
-    bias_mult = 1.0
-    kyaku = horse.kyakushitsu
+    kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
 
+    # ----------------------------------------------------
+    # 1. 5つの詳細展開シナリオ別の適性倍率（PCI × 脚質 × 上がり/マクリ）
+    # ----------------------------------------------------
+    pace_mult = 1.0
+
+    # 【スロー ① 直線ヨーイドン】残り400mキレ味勝負（有利：上がり3F上位の瞬発力馬 / 先行馬、不利：後方追込）
+    if expected_pace in ["S_YOIDON", "S"]:
+        if h_pci_type == "C": pace_mult *= 1.12
+        elif h_pci_type == "B": pace_mult *= 1.00
+        else: pace_mult *= 0.90
+
+        if kyaku == 1: pace_mult *= 1.06
+        elif kyaku == 2: pace_mult *= 1.08
+        elif kyaku == 3: pace_mult *= 1.04
+        elif kyaku == 4: pace_mult *= 0.88  # 後方一手は届かない
+
+        # 速い上がり（要求上がりより速い実績）を持つキレ味馬にボーナス
+        if time_diff <= -0.3: pace_mult *= 1.08
+        elif time_diff <= 0.1: pace_mult *= 1.04
+        elif time_diff >= 0.6: pace_mult *= 0.93
+
+    # 【スロー ② ロンスパ・マクリ】向正面〜3角仕掛け・残り800m持続戦（有利：スタミナ型先行・マクリ差し）
+    elif expected_pace == "S_LONSPA":
+        if 49.5 <= h_pci <= 54.0: pace_mult *= 1.10
+        elif h_pci_type == "C": pace_mult *= 1.04
+        else: pace_mult *= 0.94
+
+        if kyaku == 1: pace_mult *= 0.96
+        elif kyaku == 2: pace_mult *= 1.07
+        elif kyaku == 3: pace_mult *= 1.08
+        elif kyaku == 4: pace_mult *= 0.95
+
+        # 道中でポジションを押し上げたマクリ実績のある馬にボーナス
+        if makuri_flag:
+            pace_mult *= 1.07
+
+    # 【ミドル ① 地力・総合力勝負】淀みなく進行・誤魔化しの効かない王道持続戦（有利：好位抜け出し王道馬）
+    elif expected_pace in ["M_JIRIKI", "M"]:
+        if h_pci_type == "B": pace_mult *= 1.08
+        else: pace_mult *= 0.98
+
+        if kyaku == 1: pace_mult *= 0.98
+        elif kyaku == 2: pace_mult *= 1.08  # 王道先行・好位抜け出し
+        elif kyaku == 3: pace_mult *= 1.04  # 好位差し
+        elif kyaku == 4: pace_mult *= 0.92
+
+        if power_score >= 0.70:
+            pace_mult *= 1.06  # 実力上位馬が能力通りに走る
+
+    # 【ミドル ② ロンスパ戦】平均ペース＋早め仕掛けのタフ持続戦（有利：持続力ある好位〜中団差し）
+    elif expected_pace == "M_LONSPA":
+        if 46.5 <= h_pci <= 50.8: pace_mult *= 1.10
+        elif h_pci_type == "A": pace_mult *= 1.04
+        else: pace_mult *= 0.92  # キレ味だけのスロー専は苦戦
+
+        if kyaku == 1: pace_mult *= 0.91  # 早めに潰されやすい
+        elif kyaku == 2: pace_mult *= 1.04
+        elif kyaku == 3: pace_mult *= 1.09
+        elif kyaku == 4: pace_mult *= 1.02
+
+        if makuri_flag:
+            pace_mult *= 1.05
+
+    # 【ハイペース ① 前崩れのバテ合い消耗戦】ハナ争い激化・上がりがかかる大消耗戦（有利：後方待機・追込馬）
+    elif expected_pace in ["H_MAEKUZURE", "H"]:
+        if h_pci_type == "A": pace_mult *= 1.14
+        elif h_pci_type == "B": pace_mult *= 1.00
+        else: pace_mult *= 0.88
+
+        if kyaku == 1: pace_mult *= 0.84  # 前崩れ総崩れリスク
+        elif kyaku == 2: pace_mult *= 0.92
+        elif kyaku == 3: pace_mult *= 1.09
+        elif kyaku == 4: pace_mult *= 1.13  # 無欲の後方待機・追い込み強襲
+
+    # ----------------------------------------------------
+    # 2. トラックバイアス補正
+    # ----------------------------------------------------
+    bias_mult = 1.0
     if track_bias == "前残り (逃げ・先行有利)":
         if kyaku == 1: bias_mult = 1.12
         elif kyaku == 2: bias_mult = 1.06
@@ -471,18 +578,7 @@ def calculate_comprehensive_score(raw_lgb_pred, horse, power_score, h_pci_type, 
         if waku >= 6: bias_mult = 1.10
         elif waku <= 3: bias_mult = 0.94
 
-    # 4. PCIペース適性補正（最大±8%程度）
-    pci_mult = 1.0
-    if expected_pace == "H":
-        if h_pci_type == "A": pci_mult = 1.08
-        elif h_pci_type == "C": pci_mult = 0.93
-    elif expected_pace == "S":
-        if h_pci_type == "C": pci_mult = 1.08
-        elif h_pci_type == "A": pci_mult = 0.93
-    else:
-        if h_pci_type == "B": pci_mult = 1.05
-
-    return base_ability * bias_mult * pci_mult
+    return base_ability * pace_mult * bias_mult
 
 
 @app.post("/diagnose_race")
@@ -507,16 +603,15 @@ def diagnose_race(request: RaceRequest):
     base_rpci = round((avg_pace_f / avg_pace_l) * 50.0, 1) if avg_pace_l > 0 else 50.0
     base_rpci_type = get_pci_label(base_rpci)
     
-    if request.expected_pace == "H":
-        avg_pace_f -= 1.2; avg_pace_l += 1.2; avg_req_up += 0.8
-    elif request.expected_pace == "S":
-        avg_pace_f += 1.2; avg_pace_l -= 1.2; avg_req_up -= 0.8
+    avg_pace_f, avg_pace_l, avg_req_up = adjust_pace_times(
+        request.expected_pace, avg_pace_f, avg_pace_l, avg_req_up
+    )
     
     place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
     
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
-        zenso, real_agari, kaisuu, power_score = get_horse_real_stats(horse.bamei)
+        zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
@@ -536,12 +631,10 @@ def diagnose_race(request: RaceRequest):
         raw_pred = float(model.predict(input_data)[0])
         h_pci, h_pci_type = get_horse_pci_stats(horse.bamei)
 
-        # 地力・AI予測・展開・PCIを統合した最終スコア算出
         final_score = calculate_comprehensive_score(
-            raw_pred, horse, power_score, h_pci_type, request.expected_pace, request.track_bias
+            raw_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, request.expected_pace, request.track_bias
         )
         
-        # 現在のpage.tsxに100%対応した過去5走データ形式
         records = h_stats.get('race_records', [])[-5:]
         history_details = []
         for r in reversed(records):
@@ -570,7 +663,6 @@ def diagnose_race(request: RaceRequest):
             "history_details": history_details 
         })
     
-    # AI基本指数（偏差値化）
     probs = [h["base_prob"] for h in horses_data]
     mean_prob = np.mean(probs) if probs else 0
     std_prob = np.std(probs) if probs else 1
@@ -581,7 +673,6 @@ def diagnose_race(request: RaceRequest):
         h["shisu"] = round(shisu, 1)
         h["norm_win_prob"] = h["base_prob"] / total_prob
 
-    # 妙味指数（期待値）：超低能力馬の暴走を防ぐフィルター付き
     myoumi_values = []
     for h in horses_data:
         if h["odds"] > 0:
@@ -631,14 +722,13 @@ def simulate_race(request: RaceRequest):
     avg_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
     avg_pace_l = float(np.mean(pace_l)) if pace_l else 35.0
     
-    if request.expected_pace == "H":
-        avg_pace_f -= 1.2; avg_pace_l += 1.2; avg_req_up += 0.8
-    elif request.expected_pace == "S":
-        avg_pace_f += 1.2; avg_pace_l -= 1.2; avg_req_up -= 0.8
+    avg_pace_f, avg_pace_l, avg_req_up = adjust_pace_times(
+        request.expected_pace, avg_pace_f, avg_pace_l, avg_req_up
+    )
     
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
-        zenso, real_agari, kaisuu, power_score = get_horse_real_stats(horse.bamei)
+        zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
@@ -658,7 +748,7 @@ def simulate_race(request: RaceRequest):
         h_pci, h_pci_type = get_horse_pci_stats(horse.bamei)
 
         final_score = calculate_comprehensive_score(
-            raw_pred, horse, power_score, h_pci_type, request.expected_pace, request.track_bias
+            raw_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, request.expected_pace, request.track_bias
         )
         
         horses_data.append({
@@ -699,7 +789,6 @@ def simulate_race(request: RaceRequest):
         for h in horses_data:
             h["myoumi"] = 50.0
 
-    # 🏁 実力（AI基本指数 85%）と期待値（妙味指数 15%）に収束させた高精度シミュレーション
     sim_scores = []
     for h in horses_data:
         target_index = (h["shisu"] * 0.85) + (h["myoumi"] * 0.15)
