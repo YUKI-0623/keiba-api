@@ -24,7 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 1. モデルとDBのロード
 model = lgb.Booster(model_file='history_model_pro.txt')
 
 with open('encoders_pro.pkl', 'rb') as f:
@@ -95,19 +94,14 @@ def get_horse_pci_stats(bamei_str):
     avg_pci = round(float(np.mean(target_pcis)), 1)
     return avg_pci, get_pci_label(avg_pci)
 
-# ==============================================================================
-# 【STEP 1】フェーズ1: 地力スコアの算出 (着順 → クラス係数 × 2000m換算着差)
-# ==============================================================================
 def get_horse_real_stats(bamei_str):
     records = horse_history_db.get(bamei_str, {}).get('race_records', [])
     if not records: return 8.0, 35.0, 0, 0.5, False
     
-    # 欠損値対応として、DBに存在しない馬にはデフォルト値を設定
     shussou_kaisuu = len(records)
     try: zenso_chakujun = float(records[-1].get('rank', 8.0))
     except: zenso_chakujun = 8.0
     
-    # 平均上がりの算出
     up_list = []
     for r in records[-3:]:
         try:
@@ -119,9 +113,7 @@ def get_horse_real_stats(bamei_str):
     makuri_flag = False
     class_based_scores = []
     
-    # 直近最大5走で地力スコアとマクリ判定を評価
     for r in records[-5:]:
-        # マクリ判定
         passing = str(r.get('passing', ''))
         if '-' in passing:
             try:
@@ -130,26 +122,20 @@ def get_horse_real_stats(bamei_str):
                     makuri_flag = True
             except: pass
 
-        # 地力スコア（クラス係数と補正着差）の計算
-        cf = float(r.get('class_factor', 0.70))  # 取得できない場合は1勝クラス相当
-        margin = float(r.get('margin', 1.0))     # 取得できない場合は1秒負け相当
+        cf = float(r.get('class_factor', 0.70))  
+        margin = float(r.get('margin', 1.0))     
         
-        # 距離の抽出
         course_str = str(r.get('course', ''))
         dist = 2000.0
         m_dist = re.search(r'(\d{3,4})', course_str)
         if m_dist:
             dist = float(m_dist.group(1))
             
-        # 【ルール①】距離補正着差（2000m換算）
         adjusted_margin = margin * (2000.0 / dist) if dist > 0 else margin
-        
-        # 【ルール①】各走スコアの計算 (クラス係数 - 補正着差 × 0.15)
         run_score = max(0.10, cf - (adjusted_margin * 0.15))
         class_based_scores.append(run_score)
 
     if class_based_scores:
-        # 新しいレースほど重みを持たせる（加重平均）
         weights = np.arange(1, len(class_based_scores) + 1)
         power_score = np.average(class_based_scores, weights=weights)
     else:
@@ -189,7 +175,7 @@ class HorseData(BaseModel):
     kinryou: float
     bataijuu: float = 480.0
     weight_change: float = 0.0  
-    condition_override: str = "1.00"  # ★ UIから追加された当日状態
+    condition_override: str = "1.00"  
     zenso_chakujun: float = 8.0
     avg_agari: float = 35.0
     kyakushitsu: float = 2.0  
@@ -206,12 +192,11 @@ class RaceRequest(BaseModel):
     track_condition: str
     expected_pace: str = "M_JIRIKI"
     track_bias: str = "フラット"
-    bias_strength: str = "中"  # ★ UIから追加されたバイアス強度
+    bias_strength: str = "中" 
     cushion_value: float = 9.0 
 
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
-    # (既存のfetch_raceロジックはそのままなので省略せずに記載)
     headers = {'User-Agent': 'Mozilla/5.0'}
     html = None
     is_shutuba = False
@@ -296,7 +281,6 @@ def fetch_race(race_id: str):
                     try: odds = float(o_str)
                     except: pass
 
-                # 馬体重の取得
                 weight_val = 480.0
                 change_val = 0.0
                 w_m = re.search(r'<td[^>]*class="[^"]*Weight[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
@@ -342,28 +326,20 @@ def fetch_race(race_id: str):
         return {"status": "error", "message": f"パース処理エラー: {str(e)}"}
 
 
-# ==============================================================================
-# 【STEP 2】持ち時計の限界壁フィルター (1ハロンあたりの差・未経験距離流用)
-# ==============================================================================
 def get_time_limit_multiplier(horse_name, course_type, current_distance, expected_standard_time, cushion_val, track_cond):
-    # 1. 馬場状態によるフィルターON/OFF判定
     is_rough_track = (track_cond in ["稍", "重", "不"]) or (cushion_val < 8.5)
     if is_rough_track:
-        return 1.00 # 道悪・タフ馬場は時計勝負にならないためOFF
+        return 1.00 
 
-    # 2. 長距離戦（2500m以上）の免除ルール
     if current_distance >= 2500:
-        return 1.00 # 長距離はスタミナ戦のためOFF
+        return 1.00 
 
-    # 3. 馬の自己ベストの取得（同距離優先 → 隣接距離へフォールバック）
     h_records = horse_history_db.get(horse_name, {}).get('race_records', [])
     if not h_records:
-        return 1.00 # 過去データなし
+        return 1.00 
 
     best_time = None
-    best_dist = current_distance
     
-    # 優先1: 同コース種・同距離の自己ベストを探す
     same_dist_times = []
     for r in h_records:
         r_c = str(r.get('course', ''))
@@ -371,7 +347,6 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
         t_sec = parse_time_to_seconds(r.get('time'))
         if t_sec is None: continue
         
-        # 芝・ダートの判定と距離抽出
         if course_type in r_c:
             m = re.search(r'(\d{3,4})', r_c)
             if m:
@@ -382,7 +357,6 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
     if same_dist_times:
         best_time = min(same_dist_times)
     else:
-        # 優先2: ±200m〜400m以内の隣接距離の自己ベストを探す
         adjacent_times = []
         for r in h_records:
             r_c = str(r.get('course', ''))
@@ -395,9 +369,6 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
                 if m:
                     dist = int(m.group(1))
                     if abs(dist - current_distance) <= 400 and r_cond in ['良', '稍']:
-                        # その隣接距離の想定基準タイムをコースDBから取得して比較
-                        # ※簡易的に、最も一般的なコース（東京や京都など）の基準タイムを使用
-                        # （実装の複雑化を避けるため、距離のみで代表タイムを近似）
                         avg_speed = t_sec / dist
                         projected_time = avg_speed * current_distance
                         adjacent_times.append(projected_time)
@@ -406,32 +377,27 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
             best_time = min(adjacent_times)
             
     if best_time is None:
-        return 1.00 # 参考になる距離データがない
+        return 1.00 
 
-    # 4. 1ハロン（200m）あたりのタイム差を計算
     diff_sec = best_time - expected_standard_time
     halon_count = current_distance / 200.0
     diff_per_halon = diff_sec / halon_count
 
-    # 5. クッション値による判定閾値の切り替え
     mult = 1.00
     is_high_speed = (cushion_val >= 9.5)
     
     if diff_per_halon <= 0.05:
-        mult = 1.00 # ① クリア
+        mult = 1.00 
     elif diff_per_halon <= 0.10:
-        mult = 0.95 if is_high_speed else 0.98 # ② やや不足
+        mult = 0.95 if is_high_speed else 0.98 
     elif diff_per_halon <= 0.15:
-        mult = 0.88 if is_high_speed else 0.94 # ③ 不足
+        mult = 0.88 if is_high_speed else 0.94 
     else:
-        mult = 0.75 if is_high_speed else 0.88 # ④ 限界壁
+        mult = 0.75 if is_high_speed else 0.88 
 
     return mult
 
 
-# ==============================================================================
-# 総合計算エンジン (STEP 1〜4 統合版)
-# ==============================================================================
 def calculate_comprehensive_score(
     raw_lgb_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
     expected_pace, track_bias, bias_strength, cushion_value, course_rpci, 
@@ -441,9 +407,7 @@ def calculate_comprehensive_score(
         market_prob = min(0.55, 0.80 / float(horse.odds))
     else: market_prob = 0.08
 
-    # フェーズ1: 基礎能力のブレンド
     if expected_pace in ["M_JIRIKI", "M"]:
-        # ミドル① 王道戦は地力の比重をアップ (AI 45%, 地力 35%)
         base_ability = (raw_lgb_pred * 0.45) + (power_score * 0.35) + (market_prob * 0.20)
     else:
         base_ability = (raw_lgb_pred * 0.50) + (power_score * 0.30) + (market_prob * 0.20)
@@ -451,7 +415,6 @@ def calculate_comprehensive_score(
     kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
 
-    # フェーズ2: 展開シナリオの適性倍率
     pace_mult = 1.0
     if expected_pace in ["S_YOIDON", "S"]:
         if h_pci_type == "C": pace_mult *= 1.12
@@ -503,14 +466,11 @@ def calculate_comprehensive_score(
         elif kyaku == 3: pace_mult *= 1.09
         elif kyaku == 4: pace_mult *= 1.13
 
-    # 【STEP 3】RPCI乖離デバフ（舞台RPCIと好走PCIが3.0以上乖離で減点）
     if course_rpci > 0 and h_pci > 0:
         if abs(course_rpci - h_pci) >= 3.0:
             pace_mult *= 0.92
 
-    # 【STEP 3】トラックバイアス（3段階強度）
     bias_mult = 1.0
-    # 倍率設定 (弱: 1.03/0.97, 中: 1.08/0.92, 極端: 1.15/0.80)
     boost = 1.08
     nerf = 0.92
     if bias_strength == "弱":
@@ -531,14 +491,12 @@ def calculate_comprehensive_score(
         if waku >= 6: bias_mult = boost
         elif waku <= 3: bias_mult = nerf
 
-    # 【STEP 4】当日状態の手動オーバーライド倍率
     condition_mult = 1.00
     try:
         condition_mult = float(horse.condition_override)
     except:
         pass
 
-    # 【STEP 4】合成倍率のキャップ (上限1.25, 下限0.75)
     total_mult = pace_mult * bias_mult * time_limit_mult * condition_mult
     capped_mult = max(0.75, min(1.25, total_mult))
 
@@ -559,8 +517,7 @@ def diagnose_race(request: RaceRequest):
     pace_f = c_stats.get('pace_first', [])
     pace_l = c_stats.get('pace_last', [])
     
-    # コースの想定基準タイムの取得
-    expected_standard_time = c_stats.get('standard_time', 120.0) # デフォルト2分
+    expected_standard_time = c_stats.get('standard_time', 120.0) 
     
     avg_req_up = float(np.mean(top3_up)) if top3_up else 35.0
     avg_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
@@ -584,7 +541,6 @@ def diagnose_race(request: RaceRequest):
         time_diff = course_up - avg_req_up
         kishu_enc = safe_encode('kishu', horse.kishu)
         
-        # 持ち時計フィルターの計算
         time_limit_mult = get_time_limit_multiplier(
             horse.bamei, request.course_type, request.distance, 
             expected_standard_time, request.cushion_value, request.track_condition
@@ -770,7 +726,7 @@ def simulate_race(request: RaceRequest):
     sim_scores = []
     for h in horses_data:
         target_index = (h["shisu"] * 0.85) + (h["myoumi"] * 0.15)
-        noise = np.random.normal(0, 3.2) # ★シミュレーションのノイズ（標準偏差3.2）
+        noise = np.random.normal(0, 3.2)
         score = target_index + noise
         sim_scores.append({
             "umaban": h["umaban"], "bamei": h["bamei"],
