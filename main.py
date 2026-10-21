@@ -55,6 +55,71 @@ def parse_time_to_seconds(time_val):
     except:
         return None
 
+def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -> float:
+    """コースDBにstandard_timeが無い場合、距離と芝/ダートに応じた標準時計を返す"""
+    std_t = c_stats.get('standard_time')
+    if std_t is not None:
+        try:
+            val = float(std_t)
+            if val > 30.0:
+                return val
+        except:
+            pass
+    # フォールバック: 芝は1F=11.9秒(0.0595秒/m)、ダートは1F=12.4秒(0.0620秒/m)基準
+    sec_per_meter = 0.0595 if course_type == "芝" else 0.0620
+    return round(distance * sec_per_meter, 1)
+
+def infer_class_factor(record: dict) -> float:
+    """DBにclass_factorが存在しない場合のフォールバック判定"""
+    if 'class_factor' in record and record['class_factor'] is not None:
+        try:
+            return float(record['class_factor'])
+        except:
+            pass
+    r_name = str(record.get('race_name', '')) + str(record.get('grade', ''))
+    if 'G1' in r_name or 'GI' in r_name: return 1.20
+    if 'G2' in r_name or 'GII' in r_name: return 1.10
+    if 'G3' in r_name or 'GIII' in r_name or 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name: return 1.00
+    if '3勝' in r_name or '1600万' in r_name: return 0.90
+    if '2勝' in r_name or '1000万' in r_name: return 0.80
+    if '1勝' in r_name or '500万' in r_name: return 0.70
+    if '未勝利' in r_name or '新馬' in r_name: return 0.60
+    return 0.75
+
+def infer_margin_seconds(record: dict) -> float:
+    """DBにmarginが存在しない場合のフォールバック判定（マイナス着差は0.0に正規化）"""
+    if 'margin' in record and record['margin'] is not None:
+        try:
+            val = float(record['margin'])
+            return max(0.0, val)
+        except:
+            pass
+    try:
+        rank = float(record.get('rank', 8.0))
+        if rank <= 1.0: return 0.0
+        elif rank <= 3.0: return 0.2
+        elif rank <= 5.0: return 0.5
+        elif rank <= 8.0: return 0.8
+        else: return 1.3
+    except:
+        return 0.8
+
+def calc_jra_wakuban(umaban: int, total_horses: int) -> int:
+    """JRA公式ルールに基づく頭数別の正確な枠番算出フォールバック"""
+    if total_horses <= 8:
+        return max(1, min(8, umaban))
+    double_frames = min(8, total_horses - 8)
+    triple_frames = max(0, total_horses - 16)
+    single_frames = 8 - double_frames
+    if umaban <= single_frames:
+        return umaban
+    rem = umaban - single_frames
+    normal_double_count = double_frames - triple_frames
+    if rem <= normal_double_count * 2:
+        return single_frames + math.ceil(rem / 2.0)
+    rem2 = rem - (normal_double_count * 2)
+    return single_frames + normal_double_count + math.ceil(rem2 / 3.0)
+
 def calc_single_pci(course_str, time_val, up_val):
     try:
         m = re.search(r'(\d{3,4})', str(course_str))
@@ -122,8 +187,8 @@ def get_horse_real_stats(bamei_str):
                     makuri_flag = True
             except: pass
 
-        cf = float(r.get('class_factor', 0.70))  
-        margin = float(r.get('margin', 1.0))     
+        cf = infer_class_factor(r)
+        margin = infer_margin_seconds(r)
         
         course_str = str(r.get('course', ''))
         dist = 2000.0
@@ -131,13 +196,15 @@ def get_horse_real_stats(bamei_str):
         if m_dist:
             dist = float(m_dist.group(1))
             
-        adjusted_margin = margin * (2000.0 / dist) if dist > 0 else margin
-        run_score = max(0.10, cf - (adjusted_margin * 0.15))
+        # 2000m基準で着差を正規化（最大2.0秒で打ち切り、スコアは0.10〜1.20にクリップ）
+        capped_margin = min(max(margin, 0.0), 2.0)
+        adjusted_margin = capped_margin * (2000.0 / dist) if dist > 0 else capped_margin
+        run_score = float(np.clip(cf - (adjusted_margin * 0.15), 0.10, 1.20))
         class_based_scores.append(run_score)
 
     if class_based_scores:
         weights = np.arange(1, len(class_based_scores) + 1)
-        power_score = np.average(class_based_scores, weights=weights)
+        power_score = float(np.average(class_based_scores, weights=weights))
     else:
         power_score = 0.50
 
@@ -227,8 +294,21 @@ def fetch_race(race_id: str):
         track_type, distance, weather, track_condition = "芝", 2000, "晴", "良"
         match_track = re.search(r'(芝|ダ|障害)(?:専門)?(\d{3,4})m', html)
         if match_track:
-            track_type = match_track.group(1)
+            track_type = "障" if match_track.group(1) == "障害" else match_track.group(1)
             distance = int(match_track.group(2))
+
+        # 天候と馬場状態のスクレイピング
+        m_weather = re.search(r'天候\s*:\s*(晴|曇|小雨|雨|小雪|雪)', html)
+        if m_weather:
+            w_val = m_weather.group(1)
+            weather = w_val if w_val in ["晴", "曇", "雨", "小雨"] else "曇"
+
+        m_cond = re.search(r'(?:芝|ダート|馬場)\s*:\s*(良|稍重|稍|重|不良|不)', html)
+        if m_cond:
+            c_val = m_cond.group(1)
+            if c_val == "稍重": c_val = "稍"
+            elif c_val == "不良": c_val = "不"
+            track_condition = c_val
 
         horses_data = []
         horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
@@ -259,6 +339,13 @@ def fetch_race(race_id: str):
                     u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
                     if u_str.isdigit(): umaban = int(u_str)
                 if umaban == 0: continue
+
+                # 枠番のスクレイピング（取得できない場合は後段で頭数から正確に算出）
+                wakuban = 0
+                waku_m = re.search(r'<td[^>]*class="[^"]*(?:Waku)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
+                if waku_m:
+                    waku_str = re.sub(r'<[^>]*>', '', waku_m.group(1)).strip()
+                    if waku_str.isdigit(): wakuban = int(waku_str)
                 
                 bamei = f"馬番{umaban}"
                 b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
@@ -273,6 +360,13 @@ def fetch_race(race_id: str):
                 if k_m:
                     k_str = re.sub(r'<[^>]*>', '', k_m.group(1)).strip()
                     if k_str: kishu = re.sub(r'[\r\n\t\s]+', '', k_str)
+
+                # 斤量のスクレイピング（48.0〜62.0の範囲）
+                kinryou = 55.0
+                kin_matches = re.findall(r'<td[^>]*>\s*(4[8-9](?:\.\d)?|5[0-9](?:\.\d)?|6[0-2](?:\.\d)?)\s*</td>', block)
+                if kin_matches:
+                    try: kinryou = float(kin_matches[0])
+                    except: pass
 
                 odds = 10.0
                 o_m = re.search(r'<span[^>]*id="odds[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
@@ -298,9 +392,9 @@ def fetch_race(race_id: str):
                 zenso, agari, kaisuu, _, _ = get_horse_real_stats(bamei)
 
                 horses_data.append({
-                    "wakuban": min(8, math.ceil(umaban / 2)),
+                    "wakuban": wakuban,
                     "umaban": umaban, "bamei": bamei, "kishu": kishu,
-                    "odds": odds, "kinryou": 55.0, 
+                    "odds": odds, "kinryou": kinryou, 
                     "bataijuu": weight_val, "weight_change": change_val, 
                     "condition_override": "1.00",
                     "zenso_chakujun": zenso, "avg_agari": agari,
@@ -311,6 +405,11 @@ def fetch_race(race_id: str):
             except: continue
 
         horses_data = sorted(horses_data, key=lambda x: x['umaban'])
+        total_h = len(horses_data)
+        for h in horses_data:
+            if not h["wakuban"] or h["wakuban"] <= 0:
+                h["wakuban"] = calc_jra_wakuban(h["umaban"], total_h)
+
         course_key = f"{place_code}_{track_type}_{distance}"
         rpci, rpci_type, rec_pace = get_course_rpci_stats(course_key)
 
@@ -338,8 +437,10 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
     if not h_records:
         return 1.00 
 
-    best_time = None
+    best_diff_per_halon = None
+    cur_halons = current_distance / 200.0
     
+    # 優先1: 同距離の持ち時計から1Fあたりの秒差を算出
     same_dist_times = []
     for r in h_records:
         r_c = str(r.get('course', ''))
@@ -356,8 +457,10 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
                     
     if same_dist_times:
         best_time = min(same_dist_times)
+        best_diff_per_halon = (best_time - expected_standard_time) / cur_halons
     else:
-        adjacent_times = []
+        # 優先2: ±400m以内の隣接距離から算出（距離延長の減速ペナルティ考慮）
+        adjacent_diffs = []
         for r in h_records:
             r_c = str(r.get('course', ''))
             r_cond = str(r.get('cond', ''))
@@ -368,29 +471,34 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
                 m = re.search(r'(\d{3,4})', r_c)
                 if m:
                     dist = int(m.group(1))
-                    if abs(dist - current_distance) <= 400 and r_cond in ['良', '稍']:
-                        avg_speed = t_sec / dist
-                        projected_time = avg_speed * current_distance
-                        adjacent_times.append(projected_time)
+                    if 0 < abs(dist - current_distance) <= 400 and r_cond in ['良', '稍']:
+                        # 過去走のコース基準時計がDBにあれば直接1F差を比較
+                        adj_stats = course_history_db.get(r_c, {})
+                        adj_std = adj_stats.get('standard_time')
+                        if adj_std is not None:
+                            adj_diff = (t_sec - float(adj_std)) / (dist / 200.0)
+                        else:
+                            # 単純比例に距離延長減速(+0.45秒/1F)または短縮加速(-0.35秒/1F)を加味
+                            halon_gap = (current_distance - dist) / 200.0
+                            pace_penalty = halon_gap * 0.45 if halon_gap > 0 else halon_gap * 0.35
+                            projected_time = (t_sec * (current_distance / dist)) + pace_penalty
+                            adj_diff = (projected_time - expected_standard_time) / cur_halons
+                        adjacent_diffs.append(adj_diff)
         
-        if adjacent_times:
-            best_time = min(adjacent_times)
+        if adjacent_diffs:
+            best_diff_per_halon = min(adjacent_diffs)
             
-    if best_time is None:
+    if best_diff_per_halon is None:
         return 1.00 
-
-    diff_sec = best_time - expected_standard_time
-    halon_count = current_distance / 200.0
-    diff_per_halon = diff_sec / halon_count
 
     mult = 1.00
     is_high_speed = (cushion_val >= 9.5)
     
-    if diff_per_halon <= 0.05:
+    if best_diff_per_halon <= 0.05:
         mult = 1.00 
-    elif diff_per_halon <= 0.10:
+    elif best_diff_per_halon <= 0.10:
         mult = 0.95 if is_high_speed else 0.98 
-    elif diff_per_halon <= 0.15:
+    elif best_diff_per_halon <= 0.15:
         mult = 0.88 if is_high_speed else 0.94 
     else:
         mult = 0.75 if is_high_speed else 0.88 
@@ -478,7 +586,28 @@ def calculate_comprehensive_score(
     elif bias_strength == "極端":
         boost = 1.15; nerf = 0.80
 
-    if track_bias == "前残り (逃げ・先行有利)":
+    half_boost = 1.0 + (boost - 1.0) * 0.5
+    half_nerf = 1.0 - (1.0 - nerf) * 0.5
+
+    if track_bias == "イン前有利 (1〜4枠・先行)":
+        if waku <= 4 and kyaku <= 2:
+            bias_mult = boost
+        elif (waku <= 4 and kyaku == 3) or (waku == 5 and kyaku <= 2):
+            bias_mult = half_boost
+        elif waku >= 6 and kyaku >= 3:
+            bias_mult = nerf
+        elif waku >= 6 or kyaku == 4:
+            bias_mult = half_nerf
+    elif track_bias == "外差し有利 (5〜8枠・差し追込)":
+        if waku >= 5 and kyaku >= 3:
+            bias_mult = boost
+        elif (waku >= 5 and kyaku == 2) or (waku <= 4 and kyaku >= 3):
+            bias_mult = half_boost
+        elif waku <= 3 and kyaku <= 2:
+            bias_mult = nerf
+        elif waku <= 4 and kyaku == 1:
+            bias_mult = half_nerf
+    elif track_bias == "前残り (逃げ・先行有利)":
         if kyaku <= 2: bias_mult = boost
         elif kyaku >= 3: bias_mult = nerf
     elif track_bias == "差し有利 (外伸び)":
@@ -486,9 +615,11 @@ def calculate_comprehensive_score(
         elif kyaku <= 2: bias_mult = nerf
     elif track_bias == "内枠有利 (インベタ)":
         if waku <= 3: bias_mult = boost
+        elif waku == 4: bias_mult = half_boost
         elif waku >= 6: bias_mult = nerf
     elif track_bias == "外枠有利":
         if waku >= 6: bias_mult = boost
+        elif waku == 5: bias_mult = half_boost
         elif waku <= 3: bias_mult = nerf
 
     condition_mult = 1.00
@@ -517,7 +648,7 @@ def diagnose_race(request: RaceRequest):
     pace_f = c_stats.get('pace_first', [])
     pace_l = c_stats.get('pace_last', [])
     
-    expected_standard_time = c_stats.get('standard_time', 120.0) 
+    expected_standard_time = get_expected_standard_time(c_stats, request.course_type, request.distance)
     
     avg_req_up = float(np.mean(top3_up)) if top3_up else 35.0
     avg_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
@@ -645,7 +776,7 @@ def simulate_race(request: RaceRequest):
     top3_up = c_stats.get('top3_up', [])
     pace_f = c_stats.get('pace_first', [])
     pace_l = c_stats.get('pace_last', [])
-    expected_standard_time = c_stats.get('standard_time', 120.0)
+    expected_standard_time = get_expected_standard_time(c_stats, request.course_type, request.distance)
     
     avg_req_up = float(np.mean(top3_up)) if top3_up else 35.0
     avg_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
