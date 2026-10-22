@@ -14,7 +14,7 @@ import pickle
 import math
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: 全自動環境判定/2段階指数/3連系馬券構築統合)")
+app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: 全自動環境判定/2段階指数/地力上位・持ち時計注意判定)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -231,14 +231,10 @@ def adjust_pace_times(expected_pace, avg_pace_f, avg_pace_l, avg_req_up):
     elif expected_pace in ["H_MAEKUZURE", "H"]: return avg_pace_f - 1.4, avg_pace_l + 1.4, avg_req_up + 1.0
     else: return avg_pace_f, avg_pace_l, avg_req_up
 
-# =====================================================================
-# 自動判定ロジック①: 当日馬体重の増減から状態補正(condition_override)を自動判定
-# =====================================================================
 def infer_auto_condition_override(
     bamei: str, weight_val: float, change_val: float, weight_announced: bool,
     zenso: float, power_score: float, kaisuu: int
 ) -> tuple[str, str]:
-    """馬体重と過去実績から状態補正倍率と理由ラベルを返す（未発表時は1.00に安全フォールバック）"""
     if not weight_announced:
         return "1.00", "馬体重未発表（手動設定可）"
 
@@ -254,7 +250,6 @@ def infer_auto_condition_override(
             pass
     best_weight = float(np.mean(good_weights)) if good_weights else None
 
-    # 1. 大幅馬体減 (-8kg以下)
     if change_val <= -8.0:
         if weight_val <= 465.0 or change_val <= -10.0:
             return "0.88", f"大幅馬体減({int(change_val)}kg)・輸送細化懸念"
@@ -263,7 +258,6 @@ def infer_auto_condition_override(
         else:
             return "0.88", f"馬体減({int(change_val)}kg)・輸送細化判定"
 
-    # 2. やや馬体減 (-6kg 〜 -4kg)
     if -6.0 <= change_val <= -4.0:
         if best_weight and abs(weight_val - best_weight) <= 2.0 and zenso >= 4.0:
             return "1.04", "ベスト体重へ絞り込み・太め解消"
@@ -271,13 +265,11 @@ def infer_auto_condition_override(
             return "0.90", f"小柄な馬の馬体減({int(change_val)}kg)"
         return "1.00", "標準範囲内"
 
-    # 3. 増減ほぼなし (-2kg 〜 +2kg)
     if -2.0 <= change_val <= 2.0:
         if power_score >= 0.68 and zenso <= 3.0 and kaisuu >= 2:
             return "1.05", f"好調維持({change_val:+.0f}kg)・究極仕上げ"
         return "1.00", "馬体安定（標準）"
 
-    # 4. 小〜中幅プラス (+4kg 〜 +10kg)
     if 4.0 <= change_val <= 10.0:
         if best_weight and abs(weight_val - best_weight) <= 3.0:
             return "1.04", f"ベスト体重合致({change_val:+.0f}kg)・太め解消/充実"
@@ -289,7 +281,6 @@ def infer_auto_condition_override(
             return "0.92", f"凡走後の馬体増({change_val:+.0f}kg)・太め残り懸念"
         return "1.00", "標準範囲内"
 
-    # 5. 大幅プラス (+12kg以上)
     if change_val >= 12.0:
         if power_score >= 0.66 and zenso <= 3.0:
             return "1.03", f"実績馬の馬体増({change_val:+.0f}kg)・成長分"
@@ -297,12 +288,16 @@ def infer_auto_condition_override(
 
     return "1.00", "標準"
 
+def get_course_rpci_stats_from_val(rpci: float):
+    rpci_type = get_pci_label(rpci)
+    if rpci < 48.0: rec_pace = "H_MAEKUZURE"
+    elif rpci < 49.8: rec_pace = "M_LONSPA"
+    elif rpci <= 52.0: rec_pace = "M_JIRIKI"
+    elif rpci <= 53.2: rec_pace = "S_LONSPA"
+    else: rec_pace = "S_YOIDON"
+    return rpci, rpci_type, rec_pace
 
-# =====================================================================
-# 自動判定ロジック②: 出走馬の能力・脚質・PCIから予想展開(expected_pace)を自動判定
-# =====================================================================
 def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[str, str, str]:
-    """出走メンバーの脚質分布・好走PCI・マクリ実績と舞台RPCIから展開シナリオを自動判定"""
     if not horses_data or len(horses_data) < 2:
         return "M_JIRIKI", "manual_required", "⚠️ 出走馬データが不足しているため標準ペース（ミドル①）にセットしました。"
 
@@ -310,7 +305,7 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
     with_history = sum(1 for h in horses_data if h.get("shussou_kaisuu", 0) > 0)
     if with_history < max(2, total_h // 3):
         _, _, rec_p = get_course_rpci_stats_from_val(course_rpci)
-        return rec_p, "fallback_course", f"ℹ️ 過去走データが少ない（新馬・未出走多数）ため、舞台RPCI({course_rpci})基準で自動セットしました。必要に応じ手動変更してください。"
+        return rec_p, "fallback_course", f"ℹ️ 過去走データが少ないため、舞台RPCI({course_rpci})基準で自動セットしました。"
 
     nige_cnt = sum(1 for h in horses_data if int(round(h.get("kyakushitsu", 2))) == 1)
     senkou_cnt = sum(1 for h in horses_data if int(round(h.get("kyakushitsu", 2))) == 2)
@@ -336,22 +331,7 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
 
     return pace, "auto_detected", msg
 
-def get_course_rpci_stats_from_val(rpci: float):
-    rpci_type = get_pci_label(rpci)
-    if rpci < 48.0: rec_pace = "H_MAEKUZURE"
-    elif rpci < 49.8: rec_pace = "M_LONSPA"
-    elif rpci <= 52.0: rec_pace = "M_JIRIKI"
-    elif rpci <= 53.2: rec_pace = "S_LONSPA"
-    else: rec_pace = "S_YOIDON"
-    return rpci, rpci_type, rec_pace
-
-
-# =====================================================================
-# 自動判定ロジック③: 前日・当日のレース結果からトラックバイアス＆強度を自動判定
-# （土曜開催・結果確定前・過去データなし時はエラーを出さず手動設定へ安全フォールバック）
-# =====================================================================
 def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> Optional[List[Dict[str, int]]]:
-    """result.htmlから同馬場種別(芝/ダ)の1〜3着馬の枠番・4角通過順位を抽出"""
     if "HorseList" not in res_html:
         return None
     m_tr = re.search(r'(芝|ダ|障害)(?:専門)?(\d{3,4})m', res_html)
@@ -359,7 +339,7 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
         return None
     r_type = "障" if m_tr.group(1) == "障害" else m_tr.group(1)
     if r_type != target_track_type:
-        return []  # 馬場種別が違う場合は空リスト（レース自体は確定済み）
+        return []
 
     rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', res_html, re.DOTALL | re.IGNORECASE)
     if len(rows) < 3:
@@ -368,7 +348,6 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
     total_h = len(rows)
     top3_info = []
     for row in rows[:3]:
-        # 枠番抽出
         waku = 0
         w_m = re.search(r'<td[^>]*class="[^"]*Waku[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
         if w_m:
@@ -382,7 +361,6 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
                 u_s = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
                 if u_s.isdigit(): waku = calc_jra_wakuban(int(u_s), total_h)
 
-        # 通過順位抽出
         last_corner = 0
         p_m = re.search(r'<td[^>]*class="[^"]*PassageRate[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
         if p_m:
@@ -400,28 +378,20 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
 
     return top3_info if top3_info else None
 
-
 def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: str) -> tuple[str, str, str, str]:
-    """
-    当日および前日の確定済みレース結果からトラックバイアスと強度を自動判定。
-    土曜開催（金曜日はレースなし）や結果未確定時は、エラーで止めずに手動設定案内を返す。
-    """
     try:
         if len(race_id) < 12 or not race_id.isdigit():
             return "フラット", "中", "manual_required", "⚠️ レースID形式から過去レースを参照できないため、トラックバイアスは手動で設定してください。"
 
-        prefix_8 = race_id[:8]          # YYYYPPKK
-        day_num = int(race_id[8:10])    # 日目 (01〜12)
-        race_num = int(race_id[10:12])  # R (01〜12)
-
-        # 土曜開催かどうかの判定（HTML内の曜日表記、または開幕初日 day_num == 1）
+        prefix_8 = race_id[:8]
+        day_num = int(race_id[8:10])
+        race_num = int(race_id[10:12])
         is_saturday = ("(土)" in shutuba_html) or ("（土）" in shutuba_html) or (day_num == 1)
 
         headers = {'User-Agent': 'Mozilla/5.0'}
         collected_top3 = []
         sampled_race_count = 0
 
-        # 1. まず当日の直前までのレースを確認（まず1Rまたは直前Rで当日開催が確定しているかチェック）
         same_day_started = False
         if race_num >= 2:
             test_r = 1 if race_num <= 4 else max(1, race_num - 2)
@@ -440,7 +410,6 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
             except:
                 pass
 
-        # 当日のレースが進行中・確定済みの場合は、直前レースから遡って最大4鞍まで同コース種別を収集
         if same_day_started:
             for r_no in range(race_num - 1, 0, -1):
                 if sampled_race_count >= 4:
@@ -460,16 +429,13 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
                 except:
                     continue
 
-        # 2. 当日の同コース確定レースがまだ足りない場合（前日夜・朝イチなど）
         if sampled_race_count < 2:
             if is_saturday:
-                # 土曜日の場合は金曜日に中央競馬のレースが存在しないため、安全に手動設定へフォールバック
                 return (
                     "フラット", "中", "manual_required",
                     "⚠️ 土曜開催（前日金曜のレースなし）かつ当日の同コース確定レースがまだないため、トラックバイアスは手動で設定してください。"
                 )
             elif day_num >= 2:
-                # 日曜・月曜開催の場合は前日(day_num - 1)の後半レース(12R→7R)から最大4鞍を参照
                 prev_day = day_num - 1
                 for r_no in range(12, 6, -1):
                     if sampled_race_count >= 4:
@@ -495,7 +461,6 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
                 "⚠️ 参照できる前日・当日の同コース確定レース結果がまだありません。トラックバイアスは手動で設定してください。"
             )
 
-        # 3. 集計した1〜3着馬の枠番・通過順位からバイアスと強度を判定
         total_horses = len(collected_top3)
         inner_cnt = sum(1 for x in collected_top3 if x["waku"] <= 4)
         outer_cnt = sum(1 for x in collected_top3 if x["waku"] >= 5)
@@ -742,13 +707,9 @@ def fetch_race(race_id: str):
         course_key = f"{place_code}_{track_type}_{distance}"
         rpci, rpci_type, _ = get_course_rpci_stats(course_key)
 
-        # 1. 出走メンバー能力＆脚質から予想ペースを自動判定
         auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
-
-        # 2. 前日・当日のレース結果からトラックバイアス＆強度を自動判定（土曜等で未確定時は手動案内へフォールバック）
         auto_bias, auto_strength, bias_status, bias_msg = auto_detect_track_bias(race_id, track_type, html)
 
-        # 3. 馬体重発表ステータスメッセージ
         if any_weight_announced:
             weight_status = "auto_detected"
             weight_msg = "✅ 当日馬体重の増減と過去好走実績から、全頭の『状態補正（太め解消・成長分・輸送細化等）』を自動セットしました。"
@@ -1004,22 +965,22 @@ def calculate_comprehensive_score(
 
 
 # =====================================================================
-# 2段階指数による4分類 ＆ 全5種・7パターンの推奨買い目自動構築
+# 改良版: 「地力上位 × 持ち時計注意」を明確に区別して3列目に救済するロジック
 # =====================================================================
 def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
-    Stage 1（素の地力指数）と Stage 2（最終指数・妙味指数・持ち時計壁）から、
-    【1着軸】【2列目・相手本線】【3列目・地力救済ヒモ】【完全消し】に分類し、
-    単勝・複勝・ワイド・3連複(2種)・3連単(2種)の買い目と点数を生成する。
+    ・地力上位(Stage 1が1〜4位 または 地力指数55.0以上)の馬は、持ち時計不足(time_limit_mult <= 0.94)であっても
+      「完全消し」にはせず、『⚠️ 地力上位・持ち時計注意』として3列目に救済する。
+    ・地力上位で持ち時計もクリアしている馬がバイアスで沈んだ場合は『🛡️ 地力上位・バイアス救済』として3列目に救済。
+    ・地力が中位以下で持ち時計不足の馬は『💀 完全消し (持ち時計不足)』として完全除外。
     """
     if not horses_data:
         return {}
 
-    # Stage 2 (shisu) 降順でソート済みのリストを前提
     by_stage2 = sorted(horses_data, key=lambda x: (x["shisu"], x["myoumi"]), reverse=True)
     by_stage1 = sorted(horses_data, key=lambda x: x["stage1_shisu"], reverse=True)
 
-    # 1. 👑 1着軸 (AXIS_1ST) の選定: 持ち時計の壁をクリアしている最上位馬
+    # 1. 👑 1着軸 (AXIS_1ST) の選定: Stage 2 最上位（時計クリア優先）
     axis_horse = None
     for h in by_stage2:
         if h.get("time_limit_mult", 1.0) >= 0.94:
@@ -1029,68 +990,90 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         axis_horse = by_stage2[0]
     axis_umaban = axis_horse["umaban"]
 
-    # 2. 💀 完全消し (ELIMINATED) の判定: 持ち時計壁アウト(<=0.88) または 大幅馬体減(<=0.88)で指数下位
-    eliminated_umabans = set()
-    for h in by_stage2:
-        if h["umaban"] == axis_umaban:
-            continue
-        t_mult = h.get("time_limit_mult", 1.0)
-        c_mult = h.get("condition_mult", 1.0)
-        if t_mult <= 0.88:
-            eliminated_umabans.add(h["umaban"])
-            h["role_code"] = "ELIMINATED"
-            h["role_label"] = "💀 完全消し (持ち時計不足)"
-        elif c_mult <= 0.88 and h["shisu"] < 52.0:
-            eliminated_umabans.add(h["umaban"])
-            h["role_code"] = "ELIMINATED"
-            h["role_label"] = "💀 完全消し (大幅馬体減)"
-
-    # 3. 🚀 2列目・相手本線 (MAIN_2ND) の選定 (最大3頭: Stage 2上位 ＆ バイアス・妙味合致)
+    # 2. 🚀 2列目・相手本線 (MAIN_2ND) の選定 (Stage 2上位 ＆ 時計クリア＆大幅馬体減なし、最大3頭)
     main_2nd_horses = []
     for h in by_stage2:
         u = h["umaban"]
-        if u == axis_umaban or u in eliminated_umabans:
+        if u == axis_umaban:
+            continue
+        if h.get("time_limit_mult", 1.0) <= 0.88 or h.get("condition_mult", 1.0) <= 0.88:
             continue
         if len(main_2nd_horses) < 3 and (h["shisu"] >= 53.0 or (h["myoumi"] >= 57.0 and h["shisu"] >= 50.0)):
             main_2nd_horses.append(h)
 
-    # 万が一2列目が2頭未満の場合はStage2上位から補충
     if len(main_2nd_horses) < 2:
         for h in by_stage2:
             u = h["umaban"]
-            if u != axis_umaban and u not in eliminated_umabans and h not in main_2nd_horses:
+            if u != axis_umaban and h not in main_2nd_horses and h.get("time_limit_mult", 1.0) > 0.88:
                 main_2nd_horses.append(h)
                 if len(main_2nd_horses) >= 2:
                     break
 
     main_2nd_umabans = [h["umaban"] for h in main_2nd_horses]
 
-    # 4. 🛡️ 3列目・地力救済ヒモ (SAVER_3RD) の選定
-    # 条件A: Stage 2では沈んだが、Stage 1(素の地力指数)が上位6頭以内(または53.0以上)で、持ち時計壁はクリアしている実力馬（ドリームコア枠）
-    # 条件B: Stage 2で準上位(52.0以上)かつ時計壁クリアの馬
+    # 3. 🛡️/⚠️ 3列目・地力上位救済ヒモ (SAVER_3RD) の選定
     saver_3rd_horses = []
     for h in by_stage1:
         u = h["umaban"]
-        if u == axis_umaban or u in main_2nd_umabans or u in eliminated_umabans:
+        if u == axis_umaban or u in main_2nd_umabans:
             continue
-        if (h["stage1_rank"] <= 6 or h["stage1_shisu"] >= 53.0) and h.get("time_limit_mult", 1.0) >= 0.94:
+        # 大幅馬体減(0.88倍以下)で状態自体が崩れている馬は除外
+        if h.get("condition_mult", 1.0) <= 0.88:
+            continue
+
+        is_jiriki_top = (h["stage1_rank"] <= 4) or (h["stage1_shisu"] >= 55.0)
+        t_mult = h.get("time_limit_mult", 1.0)
+
+        if is_jiriki_top:
             saver_3rd_horses.append(h)
             h["is_bias_victim_rescued"] = True
-            if len(saver_3rd_horses) >= 3:
-                break
+            if t_mult <= 0.94:
+                h["rescue_type"] = "time_warn"
+            else:
+                h["rescue_type"] = "bias_victim"
+        elif (h["stage1_rank"] <= 6 or h["stage1_shisu"] >= 53.0) and t_mult >= 0.95:
+            saver_3rd_horses.append(h)
+            h["is_bias_victim_rescued"] = True
+            h["rescue_type"] = "bias_victim"
 
+        if len(saver_3rd_horses) >= 3:
+            break
+
+    # まだ3列目に余裕があればStage 2の次点馬（時計クリア）を追加
     for h in by_stage2:
         u = h["umaban"]
-        if u == axis_umaban or u in main_2nd_umabans or u in eliminated_umabans:
+        if u == axis_umaban or u in main_2nd_umabans:
             continue
-        if h not in saver_3rd_horses and h["shisu"] >= 53.0 and len(saver_3rd_horses) < 4:
+        if h not in saver_3rd_horses and h["shisu"] >= 54.0 and h.get("time_limit_mult", 1.0) >= 0.95 and len(saver_3rd_horses) < 4:
+            h["rescue_type"] = "stage2_next"
             saver_3rd_horses.append(h)
 
     saver_3rd_umabans = [h["umaban"] for h in saver_3rd_horses]
 
+    # 4. 💀 完全消し (ELIMINATED) の判定（地力上位救済に入らなかった時計不足・大幅馬体減の馬）
+    eliminated_umabans = set()
+    for h in by_stage2:
+        u = h["umaban"]
+        if u == axis_umaban or u in main_2nd_umabans or u in saver_3rd_umabans:
+            continue
+        t_mult = h.get("time_limit_mult", 1.0)
+        c_mult = h.get("condition_mult", 1.0)
+        if t_mult <= 0.88:
+            eliminated_umabans.add(u)
+            h["role_code"] = "ELIMINATED"
+            h["role_label"] = "💀 完全消し (持ち時計不足)"
+        elif c_mult <= 0.88:
+            eliminated_umabans.add(u)
+            h["role_code"] = "ELIMINATED"
+            h["role_label"] = "💀 完全消し (大幅馬体減)"
+
     # 各馬へのロールラベル付与
     for h in horses_data:
         u = h["umaban"]
+        is_jiriki_top = (h["stage1_rank"] <= 4) or (h["stage1_shisu"] >= 55.0)
+        t_mult = h.get("time_limit_mult", 1.0)
+        h["is_jiriki_time_warn"] = bool(is_jiriki_top and t_mult <= 0.94)
+
         if u == axis_umaban:
             h["role_code"] = "AXIS_1ST"
             h["role_label"] = "👑 1着軸 (不動の本命)"
@@ -1101,11 +1084,15 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
             else:
                 h["role_label"] = "🚀 2列目本線 (好位・バイアス合致)"
         elif u in saver_3rd_umabans:
-            h["role_code"] = "SAVER_3RD"
-            if h.get("is_bias_victim_rescued"):
-                h["role_label"] = f"🛡️ 3列目救済 (地力{h['stage1_rank']}位・バイアス減点)"
+            if h.get("rescue_type") == "time_warn":
+                h["role_code"] = "SAVER_3RD_TIME_WARN"
+                h["role_label"] = f"⚠️ 地力上位・持ち時計注意 (地力{h['stage1_rank']}位)"
+            elif h.get("rescue_type") == "bias_victim":
+                h["role_code"] = "SAVER_3RD"
+                h["role_label"] = f"🛡️ 地力上位・バイアス救済 (地力{h['stage1_rank']}位)"
             else:
-                h["role_label"] = "🛡️ 3列目押さえ (地力・展開圏内)"
+                h["role_code"] = "SAVER_3RD"
+                h["role_label"] = "🛡️ 3列目押さえ (展開・能力圏内)"
         elif u not in eliminated_umabans:
             h["role_code"] = "OTHER"
             h["role_label"] = "静観 (指数下位)"
@@ -1115,9 +1102,8 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
     # =================================================================
     row1 = [axis_umaban]
     row2 = main_2nd_umabans
-    row3 = main_2nd_umabans + saver_3rd_umabans  # 3列目は「2列目本線 ＋ 3列目救済馬」
+    row3 = main_2nd_umabans + saver_3rd_umabans
 
-    # 1. 単勝（1着軸 ＋ 相手本線の妙味最上位）
     value_pick = None
     cands_for_val = [h for h in main_2nd_horses if h["odds"] >= 6.0 and h["myoumi"] >= 55.0]
     if cands_for_val:
@@ -1126,22 +1112,18 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
     if value_pick and value_pick["umaban"] != axis_umaban:
         tansho_list.append({"umaban": value_pick["umaban"], "bamei": value_pick["bamei"], "type": "妙味穴単勝", "odds": value_pick["odds"]})
 
-    # 2. 複勝（1着軸 ＋ 相手本線の妙味上位1〜2頭）
     fukusho_list = [{"umaban": axis_umaban, "bamei": axis_horse["bamei"], "type": "鉄板軸", "odds": axis_horse["odds"]}]
     for mh in sorted(main_2nd_horses, key=lambda x: x["myoumi"], reverse=True)[:2]:
         fukusho_list.append({"umaban": mh["umaban"], "bamei": mh["bamei"], "type": "妙味複勝", "odds": mh["odds"]})
 
-    # 3. ワイド（1着軸 流し ➔ 2列目相手本線）
     wide_combos = [f"{axis_umaban} - {u}" for u in row2]
 
-    # 4. 3連複（1頭軸流し: 軸 row1 ➔ 相手 row3）
     sanrenpuku_nagashi_combos = []
     for i in range(len(row3)):
         for j in range(i + 1, len(row3)):
             pair = sorted([row3[i], row3[j]])
             sanrenpuku_nagashi_combos.append(f"{axis_umaban} - {pair[0]} - {pair[1]}")
 
-    # 5. 3連複（フォーメーション: 1列目 row1 / 2列目 row2 / 3列目 row3）
     sanrenpuku_form_set = set()
     for a in row1:
         for b in row2:
@@ -1150,14 +1132,12 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
                     sanrenpuku_form_set.add(tuple(sorted([a, b, c])))
     sanrenpuku_form_combos = [f"{t[0]} - {t[1]} - {t[2]}" for t in sorted(sanrenpuku_form_set)]
 
-    # 6. 3連単（1頭軸流し・1着固定: 1着 row1 ➔ 2・3着 row3）
     sanrentan_nagashi_combos = []
     for b in row3:
         for c in row3:
             if b != c:
                 sanrentan_nagashi_combos.append(f"{axis_umaban} → {b} → {c}")
 
-    # 7. 3連単（フォーメーション: 1着 row1 / 2着 row2 / 3着 row3）
     sanrentan_form_combos = []
     for a in row1:
         for b in row2:
@@ -1174,49 +1154,26 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         "formation_groups": {
             "axis_1st": [{"umaban": axis_horse["umaban"], "bamei": axis_horse["bamei"], "shisu": axis_horse["shisu"], "stage1_shisu": axis_horse["stage1_shisu"], "odds": axis_horse["odds"]}],
             "main_2nd": [{"umaban": h["umaban"], "bamei": h["bamei"], "shisu": h["shisu"], "stage1_shisu": h["stage1_shisu"], "myoumi": h["myoumi"], "odds": h["odds"]} for h in main_2nd_horses],
-            "saver_3rd": [{"umaban": h["umaban"], "bamei": h["bamei"], "shisu": h["shisu"], "stage1_shisu": h["stage1_shisu"], "stage1_rank": h["stage1_rank"], "odds": h["odds"], "rescued": h.get("is_bias_victim_rescued", False)} for h in saver_3rd_horses],
+            "saver_3rd": [{
+                "umaban": h["umaban"],
+                "bamei": h["bamei"],
+                "shisu": h["shisu"],
+                "stage1_shisu": h["stage1_shisu"],
+                "stage1_rank": h["stage1_rank"],
+                "odds": h["odds"],
+                "rescued": h.get("is_bias_victim_rescued", False),
+                "rescue_type": h.get("rescue_type", "normal"),
+                "role_label": h.get("role_label", "")
+            } for h in saver_3rd_horses],
             "eliminated": eliminated_details
         },
-        "tansho": {
-            "picks": tansho_list,
-            "count": len(tansho_list)
-        },
-        "fukusho": {
-            "picks": fukusho_list,
-            "count": len(fukusho_list)
-        },
-        "wide": {
-            "axis": axis_umaban,
-            "targets": row2,
-            "combos": wide_combos,
-            "count": len(wide_combos)
-        },
-        "sanrenpuku_nagashi": {
-            "axis": axis_umaban,
-            "targets": row3,
-            "combos": sanrenpuku_nagashi_combos,
-            "count": len(sanrenpuku_nagashi_combos)
-        },
-        "sanrenpuku_formation": {
-            "row1": row1,
-            "row2": row2,
-            "row3": row3,
-            "combos": sanrenpuku_form_combos,
-            "count": len(sanrenpuku_form_combos)
-        },
-        "sanrentan_nagashi": {
-            "first": axis_umaban,
-            "targets": row3,
-            "combos": sanrentan_nagashi_combos,
-            "count": len(sanrentan_nagashi_combos)
-        },
-        "sanrentan_formation": {
-            "first": row1,
-            "second": row2,
-            "third": row3,
-            "combos": sanrentan_form_combos,
-            "count": len(sanrentan_form_combos)
-        }
+        "tansho": {"picks": tansho_list, "count": len(tansho_list)},
+        "fukusho": {"picks": fukusho_list, "count": len(fukusho_list)},
+        "wide": {"axis": axis_umaban, "targets": row2, "combos": wide_combos, "count": len(wide_combos)},
+        "sanrenpuku_nagashi": {"axis": axis_umaban, "targets": row3, "combos": sanrenpuku_nagashi_combos, "count": len(sanrenpuku_nagashi_combos)},
+        "sanrenpuku_formation": {"row1": row1, "row2": row2, "row3": row3, "combos": sanrenpuku_form_combos, "count": len(sanrenpuku_form_combos)},
+        "sanrentan_nagashi": {"first": axis_umaban, "targets": row3, "combos": sanrentan_nagashi_combos, "count": len(sanrentan_nagashi_combos)},
+        "sanrentan_formation": {"first": row1, "second": row2, "third": row3, "combos": sanrentan_form_combos, "count": len(sanrentan_form_combos)}
     }
 
 
@@ -1264,7 +1221,7 @@ def diagnose_race(request: RaceRequest):
             expected_standard_time, request.cushion_value, request.track_condition
         )
         
-        # --- Stage 1: 枠番・当日馬体重・展開バイアスを中立化した素の地力推論 ---
+        # Stage 1: 素の地力推論
         stage1_input = pd.DataFrame([{
             '枠番': 4.0, '馬番': 8.0, '斤量': horse.kinryou, '馬体重_数値': 480.0,
             'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
@@ -1276,7 +1233,7 @@ def diagnose_race(request: RaceRequest):
         raw_pred_stage1 = float(model.predict(stage1_input)[0])
         stage1_prob = calculate_stage1_pure_score(raw_pred_stage1, horse, power_score, time_diff_base)
 
-        # --- Stage 2: 枠番・バイアス・馬体重・展開・持ち時計限界を加味した最終推論 ---
+        # Stage 2: 最終推論
         input_data = pd.DataFrame([{
             '枠番': horse.wakuban, '馬番': horse.umaban, '斤量': horse.kinryou, '馬体重_数値': horse.bataijuu,
             'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
@@ -1331,7 +1288,6 @@ def diagnose_race(request: RaceRequest):
             "history_details": history_details 
         })
     
-    # Stage 1 偏差値（素の地力指数）と順位の算出
     s1_probs = [h["stage1_prob"] for h in horses_data]
     s1_mean = np.mean(s1_probs) if s1_probs else 0
     s1_std = np.std(s1_probs) if s1_probs else 1
@@ -1343,7 +1299,6 @@ def diagnose_race(request: RaceRequest):
     for idx, h in enumerate(by_s1):
         h["stage1_rank"] = idx + 1
 
-    # Stage 2 偏差値（最終指数）と順位の算出
     probs = [h["base_prob"] for h in horses_data]
     mean_prob = np.mean(probs) if probs else 0
     std_prob = np.std(probs) if probs else 1
@@ -1381,7 +1336,6 @@ def diagnose_race(request: RaceRequest):
     for idx, h in enumerate(horses_data):
         h["stage2_rank"] = idx + 1
 
-    # 2段階指数に基づく4分類 ＆ 全5種・7パターンの馬券構築
     betting_tickets = build_betting_recommendations(horses_data)
 
     return {
