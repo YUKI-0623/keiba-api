@@ -14,7 +14,7 @@ import pickle
 import math
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: ハイブリッドオッズ自動取得/全自動環境判定/2段階指数)")
+app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: 当日・前日バイアス自動切替/ハイブリッドオッズ/2段階指数)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -233,27 +233,21 @@ def adjust_pace_times(expected_pace, avg_pace_f, avg_pace_l, avg_req_up):
 
 
 # =====================================================================
-# 新設: 終了レース(HTML形式) ＆ 未来レース(JavaScript API形式) ハイブリッドオッズ取得
+# 終了レース(HTML形式) ＆ 未来レース(JavaScript API形式) ハイブリッドオッズ取得
 # =====================================================================
 def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], Dict[int, tuple[float, float]]]:
-    """
-    【終了した過去レース用: HTML形式】
-    result.html の結果テーブル(<tr class="HorseList">)から馬番ごとの確定単勝オッズと馬体重を抽出する
-    """
     odds_map: Dict[int, float] = {}
     weight_map: Dict[int, tuple[float, float]] = {}
 
     if "HorseList" not in result_html:
         return odds_map, weight_map
 
-    # 結果ページであるかの確認（着順列 Result_Num または払戻テーブルの存在チェック）
     if "Result_Num" not in result_html and "Pay_Table" not in result_html and "All_Result_Table" not in result_html:
         return odds_map, weight_map
 
     rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', result_html, re.DOTALL | re.IGNORECASE)
     for row in rows:
         try:
-            # 1. 馬番の抽出
             umaban = 0
             u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban|Num\s+Txt_C|Num)[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if u_m:
@@ -269,7 +263,6 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
             if umaban == 0:
                 continue
 
-            # 2. 単勝オッズの抽出（Odds Txt_R クラス優先、なければ Odds クラス内の小数点数値）
             odds_val = None
             o_m = re.search(r'<td[^>]*class="[^"]*Odds\s+Txt_R[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if o_m:
@@ -288,7 +281,6 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
                         break
 
             if odds_val is None:
-                # フォールバック: 行内の全tdから単勝オッズ列（通常10列目付近の小数）を探索
                 tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
                 for idx_td in [10, 9, 11, 8]:
                     if idx_td < len(tds):
@@ -302,7 +294,6 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
             if odds_val is not None and odds_val >= 1.0:
                 odds_map[umaban] = odds_val
 
-            # 3. 確定馬体重の抽出（過去レースの補完用）
             w_m = re.search(r'<td[^>]*class="[^"]*Weight[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if w_m:
                 w_str = re.sub(r'<[^>]*>', '', w_m.group(1)).strip()
@@ -316,11 +307,6 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
 
 
 def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, float], str]:
-    """
-    【未来のレース・馬券購入可能後のレース用: JavaScript動的API形式】
-    netkeibaの出馬表JavaScriptが非同期で呼び出している api_get_jra_odds.html から
-    リアルタイム単勝オッズ（未発売時は予想オッズ）を取得する。
-    """
     odds_map: Dict[int, float] = {}
     js_headers = {
         'User-Agent': headers.get('User-Agent', 'Mozilla/5.0'),
@@ -328,7 +314,6 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
         'X-Requested-With': 'XMLHttpRequest'
     }
 
-    # action=update (発売中の最新オッズ) -> action=init (初期/予想オッズ含む) の順で試行
     api_urls = [
         f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=update&compress=0&output=json",
         f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=init&compress=0&output=json",
@@ -390,11 +375,6 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
 def fetch_hybrid_odds_and_result_weights(
     race_id: str, shutuba_html: str, headers: dict
 ) -> tuple[Dict[int, float], Dict[int, tuple[float, float]], str, str]:
-    """
-    レースが「終了した過去レース」か「馬券発売後/未来のレース」かを自動判別し、
-    HTML形式とJavaScript(API)形式を自動で切り替えて単勝オッズを取得する。
-    """
-    # 1. まずレース結果ページ(result.html)を確認し、終了レースならHTML形式で取得
     try:
         time.sleep(0.25)
         res_result = requests.get(
@@ -414,7 +394,6 @@ def fetch_hybrid_odds_and_result_weights(
     except:
         pass
 
-    # 予備: 古い過去レース等で db.netkeiba.com 側に結果HTMLがある場合
     try:
         if len(race_id) == 12 and int(race_id[:4]) < datetime.now().year:
             time.sleep(0.25)
@@ -440,7 +419,6 @@ def fetch_hybrid_odds_and_result_weights(
     except:
         pass
 
-    # 2. 終了レースではない場合 ➔ 未来/当日発走前レースとしてJavaScript動的API形式で取得
     js_odds, js_mode = fetch_future_race_js_odds(race_id, headers)
     if len(js_odds) >= 2:
         if js_mode == "js_yoso":
@@ -457,7 +435,6 @@ def fetch_hybrid_odds_and_result_weights(
             f"✅ オッズ自動取得 [未来/当日レース・JS形式]: JavaScript動的APIから最新単勝オッズ（{len(js_odds)}頭）を自動反映しました。"
         )
 
-    # 3. フォールバック: shutuba.html 内に直接埋め込まれているオッズがあれば抽出
     inline_odds: Dict[int, float] = {}
     for m_in in re.finditer(r'id="odds-1_(\d+)"[^>]*>\s*(\d+\.\d+)\s*<', shutuba_html):
         try:
@@ -472,7 +449,6 @@ def fetch_hybrid_odds_and_result_weights(
             f"✅ オッズ自動取得 [出馬表HTML]: 出馬表ページから単勝オッズ（{len(inline_odds)}頭）を自動反映しました。"
         )
 
-    # 4. 完全に未発売・未算出の場合
     return (
         {},
         {},
@@ -581,9 +557,19 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
 
     return pace, "auto_detected", msg
 
+
 def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> Optional[List[Dict[str, int]]]:
+    """
+    result.htmlが確定済みかどうか、またtarget_track_type(芝/ダ)と一致するかを判定。
+    ・未確定ページの場合: None を返す
+    ・確定済みだが別コース(例:芝狙いなのにダート)の場合: 空リスト [] を返す
+    ・確定済みかつ同コースの場合: 1〜3着の枠番と4角位置のリストを返す
+    """
     if "HorseList" not in res_html:
         return None
+    if "Result_Num" not in res_html and "PassageRate" not in res_html and "All_Result_Table" not in res_html:
+        return None
+
     m_tr = re.search(r'(芝|ダ|障害)(?:専門)?(\d{3,4})m', res_html)
     if not m_tr:
         return None
@@ -628,89 +614,143 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
 
     return top3_info if top3_info else None
 
+
+def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]:
+    """
+    <title>タグやActiveタブから、対象レース自身の開催年月日を抽出し、
+    正確な曜日（月=0 ... 金=4, 土=5, 日=6）を返す。
+    （ページ内の他日程タブの「(土)」文字列による誤判定を防止）
+    """
+    title_m = re.search(r'<title>(.*?)</title>', shutuba_html, re.IGNORECASE | re.DOTALL)
+    if title_m:
+        t_str = title_m.group(1)
+        d_m = re.search(r'(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日', t_str)
+        if d_m:
+            try:
+                dt = datetime(int(d_m.group(1)), int(d_m.group(2)), int(d_m.group(3)))
+                return dt.weekday()
+            except:
+                pass
+
+    # Activeな日付タブから曜日を判定
+    act_m = re.search(r'<dd[^>]*class="[^"]*Active[^"]*"[^>]*>(.*?)</dd>', shutuba_html, re.IGNORECASE | re.DOTALL)
+    if act_m:
+        act_txt = act_m.group(1)
+        if "土" in act_txt: return 5
+        if "日" in act_txt: return 6
+        if "月" in act_txt: return 0
+
+    if day_num == 1:
+        return 5
+    return None
+
+
 def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: str) -> tuple[str, str, str, str]:
+    """
+    ・パターン1（当日8R頃に11Rを予想 / 土曜11Rを予想）:
+      当日の1Rが確定していれば、直前R(race_num-1)〜1Rをスキャンし、当日の確定済み同コース結果からバイアスを算出。
+    ・パターン2（土曜日に日曜11Rを予想 / 日曜朝イチに日曜のレースを予想）:
+      当日の確定レースがまだ無い（または1鞍以下）場合、前日（土曜日: day_num - 1）の12R〜1Rをすべてスキャンし、
+      土曜日の同コース結果からバイアスを算出。
+    ・パターン3（金曜に土曜を予想など、当日も前日も結果がない場合）:
+      エラーを出さず手動入力案内へ安全にフォールバック。
+    """
     try:
         if len(race_id) < 12 or not race_id.isdigit():
             return "フラット", "中", "manual_required", "⚠️ レースID形式から過去レースを参照できないため、トラックバイアスは手動で設定してください。"
 
-        prefix_8 = race_id[:8]
-        day_num = int(race_id[8:10])
-        race_num = int(race_id[10:12])
-        is_saturday = ("(土)" in shutuba_html) or ("（土）" in shutuba_html) or (day_num == 1)
+        prefix_8 = race_id[:8]          # YYYYPPKK
+        day_num = int(race_id[8:10])    # 日目 (01〜12)
+        race_num = int(race_id[10:12])  # R (01〜12)
+
+        weekday = detect_target_race_weekday(shutuba_html, day_num)
+        is_saturday_race = (weekday == 5) or (day_num == 1)
 
         headers = {'User-Agent': 'Mozilla/5.0'}
         collected_top3 = []
-        sampled_race_count = 0
+        sampled_same_day = 0
+        sampled_prev_day = 0
 
-        same_day_started = False
+        # =========================================================
+        # STEP 1: 当日(day_num)の確定レースがあるかチェック（1Rで確認）
+        # =========================================================
+        same_day_has_results = False
         if race_num >= 2:
-            test_r = 1 if race_num <= 4 else max(1, race_num - 2)
-            test_id = f"{prefix_8}{day_num:02d}{test_r:02d}"
+            r1_id = f"{prefix_8}{day_num:02d}01"
             try:
-                time.sleep(0.25)
-                r_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={test_id}", headers=headers, timeout=4)
-                if r_res.status_code == 200:
-                    r_res.encoding = r_res.apparent_encoding
-                    if "Result_Num" in r_res.text or "PassageRate" in r_res.text:
-                        same_day_started = True
-                        parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
-                        if parsed:
-                            collected_top3.extend(parsed)
-                            sampled_race_count += 1
+                time.sleep(0.2)
+                r1_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={r1_id}", headers=headers, timeout=4)
+                if r1_res.status_code == 200:
+                    r1_res.encoding = r1_res.apparent_encoding
+                    parsed_r1 = parse_single_race_result_for_bias(r1_res.text, target_track_type)
+                    if parsed_r1 is not None:
+                        same_day_has_results = True
+                        # 1Rが確定していれば、直前レース(race_num - 1)から2Rまで新しい順にスキャン
+                        for r_no in range(race_num - 1, 1, -1):
+                            if sampled_same_day >= 5:
+                                break
+                            cid = f"{prefix_8}{day_num:02d}{r_no:02d}"
+                            try:
+                                time.sleep(0.2)
+                                r_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers=headers, timeout=4)
+                                if r_res.status_code == 200:
+                                    r_res.encoding = r_res.apparent_encoding
+                                    parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
+                                    # 未確定レース(parsed is None)はスキップして確定済みレースを拾う
+                                    if parsed:
+                                        collected_top3.extend(parsed)
+                                        sampled_same_day += 1
+                            except:
+                                continue
+                        # 1R自体も同コースかつまだ5鞍未満なら追加
+                        if parsed_r1 and sampled_same_day < 5:
+                            collected_top3.extend(parsed_r1)
+                            sampled_same_day += 1
             except:
                 pass
 
-        if same_day_started:
-            for r_no in range(race_num - 1, 0, -1):
-                if sampled_race_count >= 4:
+        # =========================================================
+        # STEP 2: 当日の同コース確定レースが2鞍未満の場合 ➔ 前日(土曜日等: day_num - 1)の12R〜1Rを探索
+        # （土曜に日曜11Rを予想する時、または日曜午前中で当日芝レースがまだ少ない時）
+        # =========================================================
+        if sampled_same_day < 2 and day_num >= 2 and not is_saturday_race:
+            prev_day = day_num - 1
+            # まず前日のメイン付近(11Rまたは1R)が存在するか確認し、12Rから1Rまで同コースを最大5鞍収集
+            for r_no in range(12, 0, -1):
+                if (sampled_same_day + sampled_prev_day) >= 5:
                     break
-                if r_no == (1 if race_num <= 4 else max(1, race_num - 2)):
-                    continue
-                cid = f"{prefix_8}{day_num:02d}{r_no:02d}"
+                cid = f"{prefix_8}{prev_day:02d}{r_no:02d}"
                 try:
-                    time.sleep(0.25)
+                    time.sleep(0.2)
                     r_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers=headers, timeout=4)
                     if r_res.status_code == 200:
                         r_res.encoding = r_res.apparent_encoding
                         parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
+                        if parsed is None and r_no == 11 and sampled_prev_day == 0:
+                            # 前日の11Rすら未確定なら前日データもまだ存在しないと判断して打ち切り
+                            break
                         if parsed:
                             collected_top3.extend(parsed)
-                            sampled_race_count += 1
+                            sampled_prev_day += 1
                 except:
                     continue
 
-        if sampled_race_count < 2:
-            if is_saturday:
+        total_sampled_races = sampled_same_day + sampled_prev_day
+
+        if total_sampled_races < 2 or len(collected_top3) < 4:
+            if is_saturday_race and not same_day_has_results:
                 return (
                     "フラット", "中", "manual_required",
-                    "⚠️ 土曜開催（前日金曜のレースなし）かつ当日の同コース確定レースがまだないため、トラックバイアスは手動で設定してください。"
+                    "⚠️ 土曜開催のレース開始前（前日金曜のレースなし）のため、トラックバイアスは手動で設定してください。"
                 )
-            elif day_num >= 2:
-                prev_day = day_num - 1
-                for r_no in range(12, 6, -1):
-                    if sampled_race_count >= 4:
-                        break
-                    cid = f"{prefix_8}{prev_day:02d}{r_no:02d}"
-                    try:
-                        time.sleep(0.25)
-                        r_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers=headers, timeout=4)
-                        if r_res.status_code == 200:
-                            r_res.encoding = r_res.apparent_encoding
-                            if "Result_Num" not in r_res.text and "PassageRate" not in r_res.text:
-                                break
-                            parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
-                            if parsed:
-                                collected_top3.extend(parsed)
-                                sampled_race_count += 1
-                    except:
-                        continue
-
-        if sampled_race_count < 2 or len(collected_top3) < 4:
             return (
                 "フラット", "中", "manual_required",
-                "⚠️ 参照できる前日・当日の同コース確定レース結果がまだありません。トラックバイアスは手動で設定してください。"
+                "⚠️ 参照できる当日・前日の同コース確定レース結果がまだありません。トラックバイアスは手動で設定してください。"
             )
 
+        # =========================================================
+        # STEP 3: 収集した1〜3着馬の枠番・通過順位からバイアスと強度を判定
+        # =========================================================
         total_horses = len(collected_top3)
         inner_cnt = sum(1 for x in collected_top3 if x["waku"] <= 4)
         outer_cnt = sum(1 for x in collected_top3 if x["waku"] >= 5)
@@ -752,9 +792,16 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
             detected_bias = "外枠有利"
             detected_strength = "極端" if outer_rate >= 0.75 else "中"
 
+        if sampled_same_day >= 2 and sampled_prev_day == 0:
+            source_label = f"当日({day_num}日目)の最新同コース結果 {sampled_same_day}鞍"
+        elif sampled_same_day == 0 and sampled_prev_day >= 2:
+            source_label = f"前日・土曜({day_num - 1}日目)の同コース確定結果 {sampled_prev_day}鞍"
+        else:
+            source_label = f"当日{sampled_same_day}鞍＋前日{sampled_prev_day}鞍の同コース結果"
+
         summary_msg = (
-            f"✅ 直近の同コース確定結果（計{sampled_race_count}鞍・上位{total_horses}頭："
-            f"内枠率{int(inner_rate*100)}% / 4角4番手以内率{int(front_rate*100)}%）から"
+            f"✅ バイアス自動判定 [{source_label} / 上位{total_horses}頭集計]："
+            f"内枠率{int(inner_rate*100)}%・4角4番手以内率{int(front_rate*100)}% ➔ "
             f"『{detected_bias}（強度:{detected_strength}）』を自動セットしました。"
         )
         return detected_bias, detected_strength, "auto_detected", summary_msg
@@ -843,7 +890,6 @@ def fetch_race(race_id: str):
             elif c_val == "不良": c_val = "不"
             track_condition = c_val
 
-        # ★ 終了レース(HTML形式) ＆ 未来レース(JavaScript動的API形式) のハイブリッドオッズ取得
         hybrid_odds_map, result_weight_map, odds_status, odds_msg = fetch_hybrid_odds_and_result_weights(
             race_id, html, headers
         )
@@ -906,7 +952,6 @@ def fetch_race(race_id: str):
                     try: kinryou = float(kin_matches[0])
                     except: pass
 
-                # オッズの設定（ハイブリッド取得結果を最優先し、無ければブロック内HTML、最後に10.0）
                 odds = 10.0
                 if umaban in hybrid_odds_map:
                     odds = hybrid_odds_map[umaban]
@@ -938,7 +983,6 @@ def fetch_race(race_id: str):
                         if m_weight2:
                             weight_val = float(m_weight2.group(1))
 
-                # 終了レースでshutuba側に馬体重が無くresult.html側にある場合は補完
                 if not weight_announced and umaban in result_weight_map:
                     weight_val, change_val = result_weight_map[umaban]
                     weight_announced = True
