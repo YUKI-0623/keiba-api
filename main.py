@@ -15,7 +15,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (アプローチ①＋②＋③実装版: DB×5走柱＋重賞着差・上がり順位＋血統・距離適性)")
+app = FastAPI(title="競馬シミュレーションAPI (アプローチ①〜④実装版: DB×5走柱＋重賞着差・上がり順位＋血統＋ローテ・追切)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,12 +42,8 @@ runtime_pedigree_db: Dict[str, Dict[str, str]] = {}
 
 # =====================================================================
 # アプローチ③: 主要種牡馬（父・母父）適性プロファイル辞書
-# stamina: 長距離・距離延長耐性 (-2.0:短距離偏重 〜 +3.0:超長距離・ステイヤー)
-# heavy  : 道悪・タフ馬場パワー適性 (-1.5:良馬場専用 〜 +3.0:道悪の鬼)
-# lonspa : 下り坂・ロングスパート持続力 (0.0:標準 〜 +2.0:持続力特化)
 # =====================================================================
 SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
-    # ステイヤー・王道クラシック長距離型 (+2.5 〜 +3.0)
     "キタサンブラック": {"stamina": 3.0, "heavy": 2.5, "lonspa": 2.0},
     "エピファネイア": {"stamina": 3.0, "heavy": 2.0, "lonspa": 2.0},
     "ワールドプレミア": {"stamina": 3.0, "heavy": 2.5, "lonspa": 2.0},
@@ -62,7 +58,6 @@ SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "スクリーンヒーロー": {"stamina": 2.5, "heavy": 2.5, "lonspa": 1.8},
     "ダンスインザダーク": {"stamina": 3.0, "heavy": 1.5, "lonspa": 2.0},
     "トニービン": {"stamina": 2.8, "heavy": 2.0, "lonspa": 2.0},
-    # 万能クラシック・中長距離持続型 (+1.5 〜 +2.4)
     "スワーヴリチャード": {"stamina": 2.4, "heavy": 2.5, "lonspa": 2.0},
     "キズナ": {"stamina": 2.3, "heavy": 2.5, "lonspa": 1.8},
     "ドゥラメンテ": {"stamina": 2.4, "heavy": 2.2, "lonspa": 1.8},
@@ -90,9 +85,7 @@ SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "ノヴェリスト": {"stamina": 2.4, "heavy": 2.5, "lonspa": 1.6},
     "シンボリクリスエス": {"stamina": 2.2, "heavy": 2.4, "lonspa": 1.8},
     "ネオユニヴァース": {"stamina": 2.2, "heavy": 2.5, "lonspa": 1.6},
-    "ハーツクライ系": {"stamina": 2.5, "heavy": 1.5, "lonspa": 1.8},
     "Malibu Moon": {"stamina": 1.8, "heavy": 2.0, "lonspa": 1.5},
-    # マイル〜中距離・スピード型 (-0.5 〜 +1.2)
     "ロードカナロア": {"stamina": 0.8, "heavy": 1.2, "lonspa": 1.0},
     "ダイワメジャー": {"stamina": -0.5, "heavy": 1.8, "lonspa": 0.5},
     "クロフネ": {"stamina": 0.0, "heavy": 2.0, "lonspa": 0.8},
@@ -102,7 +95,6 @@ SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "ナダル": {"stamina": 1.0, "heavy": 2.2, "lonspa": 1.0},
     "ドレフォン": {"stamina": 0.5, "heavy": 2.0, "lonspa": 0.8},
     "マインドユアビスケッツ": {"stamina": 0.5, "heavy": 2.0, "lonspa": 0.8},
-    # 短距離・マイラー偏重（長距離延長時割引: -1.0 〜 -2.0）
     "グレーターロンドン": {"stamina": -1.2, "heavy": 0.0, "lonspa": 0.5},
     "ミッキーアイル": {"stamina": -1.5, "heavy": 1.0, "lonspa": 0.2},
     "ビッグアーサー": {"stamina": -2.0, "heavy": 1.0, "lonspa": 0.0},
@@ -114,7 +106,6 @@ SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "シニスターミニスター": {"stamina": -0.5, "heavy": 2.2, "lonspa": 0.5},
 }
 
-# 2026年クラシック・重賞主要馬の血統フォールバック辞書（HTML構造変更時でも100%確実に動作させるための安全網）
 KNOWN_HORSE_PEDIGREE: Dict[str, Dict[str, str]] = {
     "ロブチェン": {"sire": "ワールドプレミア", "bms": "Giant's Causeway"},
     "ダノンヒストリー": {"sire": "エピファネイア", "bms": "Malibu Moon"},
@@ -136,6 +127,13 @@ KNOWN_HORSE_PEDIGREE: Dict[str, Dict[str, str]] = {
     "ショウナンガルフ": {"sire": "キズナ", "bms": "キングカメハメハ"},
 }
 
+TRAINING_RANK_MULTIPLIERS: Dict[str, float] = {
+    "S": 1.05,  # 抜群・自己ベスト級・併せ馬圧倒
+    "A": 1.03,  # 好調・動き素軽い・上積み大
+    "B": 1.00,  # 標準・平行線（デフォルト）
+    "C": 0.92,  # 割引・併せ馬遅れ・終い減速・重め残り
+}
+
 def safe_encode(encoder_name, value):
     if encoder_name not in encoders:
         return 0
@@ -155,6 +153,30 @@ def parse_time_to_seconds(time_val):
         return float(s)
     except:
         return None
+
+def parse_date_str(d_str: str) -> Optional[datetime]:
+    if not d_str:
+        return None
+    s = str(d_str).strip().replace('.', '/').replace('-', '/')
+    m = re.search(r'(20\d{2})/(\d{1,2})/(\d{1,2})', s)
+    if m:
+        try:
+            return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except:
+            return None
+    return None
+
+def extract_target_race_date(shutuba_html: str) -> Optional[datetime]:
+    title_m = re.search(r'<title>(.*?)</title>', shutuba_html, re.IGNORECASE | re.DOTALL)
+    if title_m:
+        t_str = title_m.group(1)
+        d_m = re.search(r'(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日', t_str)
+        if d_m:
+            try:
+                return datetime(int(d_m.group(1)), int(d_m.group(2)), int(d_m.group(3)))
+            except:
+                pass
+    return None
 
 def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -> float:
     std_t = c_stats.get('standard_time')
@@ -237,19 +259,14 @@ def infer_margin_seconds(record: dict) -> float:
 
 
 def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
-    """
-    shutuba_past.html の馬情報列またはサーバーDB・既知辞書から「父(sire)」と「母父(bms)」を抽出する。
-    """
     sire = ""
     bms = ""
 
-    # 1. サーバーDB (horse_history_db.pkl) に血統情報が入っているかチェック
     db_entry = horse_history_db.get(bamei, {})
     if isinstance(db_entry, dict):
         sire = str(db_entry.get('sire', db_entry.get('father', db_entry.get('父', '')))).strip()
         bms = str(db_entry.get('bms', db_entry.get('mother_father', db_entry.get('母父', '')))).strip()
 
-    # 2. shutuba_past.html の馬情報セル（Pastセルより左側の領域）から抽出
     first_past_pos = row_html.find('class="Past')
     info_chunk = row_html[:first_past_pos] if first_past_pos != -1 else row_html
 
@@ -268,7 +285,6 @@ def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
             if m_paren:
                 bms = m_paren.group(1).strip()
 
-    # 3. タグ構造が変わっていた場合でも、info_chunkのテキストとSIRE_APTITUDE_DBの種牡馬名を直接照合
     clean_info = re.sub(r'<[^>]*>', ' ', info_chunk)
     bamei_pos = clean_info.find(bamei)
     if bamei_pos != -1:
@@ -285,7 +301,6 @@ def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
                     bms = s_name
                     break
 
-    # 4. プリセット辞書による補完
     if bamei in KNOWN_HORSE_PEDIGREE:
         if not sire:
             sire = KNOWN_HORSE_PEDIGREE[bamei].get("sire", "")
@@ -295,9 +310,6 @@ def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
     return {"sire": sire, "bms": bms}
 
 
-# =====================================================================
-# アプローチ①＋③: shutuba_past.html（5走柱＋血統）リアルタイム取得 ＆ 既存DBとのハイブリッドマージ
-# =====================================================================
 def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[str]) -> tuple[bool, int]:
     place_map_rev = {'札幌':'01', '函館':'02', '福島':'03', '新潟':'04', '東京':'05', '中山':'06', '中京':'07', '京都':'08', '阪神':'09', '小倉':'10'}
     enriched_horse_count = 0
@@ -333,7 +345,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
             if not bamei or bamei not in runtime_enriched_db:
                 continue
 
-            # ★アプローチ③: 父・母父の抽出
             ped_info = extract_pedigree_from_row(row, bamei)
             if ped_info.get("sire") or ped_info.get("bms"):
                 runtime_pedigree_db[bamei] = ped_info
@@ -458,6 +469,8 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                         same_course = (new_r["course"] == str(ex_r.get("course", "")))
                         same_rank = (int(new_r["rank"]) == int(float(ex_r.get("rank", 99))))
                         if (same_time and same_course) or (same_course and same_rank and new_r["up"] == str(ex_r.get("up", ""))):
+                            if new_r["date"]:
+                                ex_r["date"] = new_r["date"]
                             if new_r["margin"] is not None:
                                 ex_r["margin"] = new_r["margin"]
                             if new_r["grade"]:
@@ -501,17 +514,9 @@ def get_horse_pedigree_info(bamei_str: str) -> Dict[str, str]:
     return {"sire": "", "bms": ""}
 
 
-# =====================================================================
-# アプローチ③: 血統（父・母父）× 距離ショック耐性・長距離実証・道悪適性エンジン
-# =====================================================================
 def evaluate_pedigree_and_distance_aptitude(
     bamei: str, course_type: str, target_distance: int, track_cond: str, cushion_val: float
 ) -> tuple[float, float, str]:
-    """
-    戻り値: (stage1_ped_mult, stage2_ped_mult, pedigree_summary_text)
-    ・stage1_ped_mult: 今回のコース距離に対する「血統スタミナ＋本人の長距離好走実績」補正 (0.95 〜 1.05)
-    ・stage2_ped_mult: Stage1補正に加え、当日の「道悪/タフ馬場×パワー血統・道悪実績」まで加味した補正 (0.93 〜 1.07)
-    """
     ped = get_horse_pedigree_info(bamei)
     sire = ped.get("sire", "")
     bms = ped.get("bms", "")
@@ -519,7 +524,6 @@ def evaluate_pedigree_and_distance_aptitude(
     sire_prof = SIRE_APTITUDE_DB.get(sire, {"stamina": 1.0, "heavy": 1.0, "lonspa": 1.0})
     bms_prof = SIRE_APTITUDE_DB.get(bms, {"stamina": 1.0, "heavy": 1.0, "lonspa": 1.0})
 
-    # 父70% ＋ 母父30% の合成血統スコア
     stamina_index = (sire_prof["stamina"] * 0.75) + (bms_prof["stamina"] * 0.25) if bms else sire_prof["stamina"]
     heavy_index = (sire_prof["heavy"] * 0.70) + (bms_prof["heavy"] * 0.30) if bms else sire_prof["heavy"]
     lonspa_index = (sire_prof["lonspa"] * 0.75) + (bms_prof["lonspa"] * 0.25) if bms else sire_prof["lonspa"]
@@ -550,12 +554,10 @@ def evaluate_pedigree_and_distance_aptitude(
 
     dist_extension = (target_distance - max_good_dist) if max_good_dist > 0 else 0
 
-    # 1. 距離適性・距離延長ショック判定 (Stage1 & Stage2 共通のベース)
     dist_mult = 1.00
     notes = []
 
     if target_distance >= 2400:
-        # 2400m以上の長距離戦（菊花賞3000m・天皇賞春3200m・ダービー・有馬など）
         if stamina_index >= 2.6:
             dist_mult *= 1.035 if target_distance >= 2800 else 1.025
             notes.append("長距離血統◎")
@@ -566,26 +568,22 @@ def evaluate_pedigree_and_distance_aptitude(
             dist_mult *= 0.945 if target_distance >= 2800 else 0.965
             notes.append("距離延長不安")
 
-        # 大幅距離延長ショック (+400m以上未経験) の際の血統底力差
         if dist_extension >= 400:
             if stamina_index >= 2.7:
                 dist_mult *= 1.012
             elif stamina_index <= 0.0:
                 dist_mult *= 0.975
 
-        # 本人自身がすでに2500m以上で連対・勝利実績がある場合（ダノンヒストリー等）
         if proven_long_dist_wins >= 1:
             dist_mult *= 1.022
             notes.append("長距離実績◎")
 
     elif target_distance <= 1400:
-        # 短距離戦では逆にステイヤー血統を少し割り引き、スピード血統を優遇
         if stamina_index <= -1.0:
             dist_mult *= 1.02
         elif stamina_index >= 2.8:
             dist_mult *= 0.97
 
-    # 2. 当日の馬場状態（道悪・稍重気味のタフ馬場）× パワー血統・道悪実績 (Stage2用)
     heavy_mult = 1.00
     is_wet_or_tough = (track_cond in ["稍", "重", "不"]) or (cushion_val <= 9.2)
     if is_wet_or_tough:
@@ -598,7 +596,6 @@ def evaluate_pedigree_and_distance_aptitude(
             heavy_mult *= 1.018
             notes.append("道悪実績◎")
 
-    # 3. ロングスパート血統ボーナス
     lonspa_mult = 1.01 if (target_distance >= 2000 and lonspa_index >= 1.9) else 1.00
 
     stage1_ped_mult = float(np.clip(dist_mult, 0.94, 1.05))
@@ -611,6 +608,96 @@ def evaluate_pedigree_and_distance_aptitude(
         ped_label = f"🧬父{sire}{bms_str}{note_str}"
 
     return stage1_ped_mult, stage2_ped_mult, ped_label
+
+
+# =====================================================================
+# アプローチ④: ローテーション（休み明け叩き2走目・3走目・レース間隔）自動算出エンジン
+# =====================================================================
+def evaluate_rotation_aptitude(
+    bamei: str, target_race_date: Optional[datetime], power_score: float, target_distance: int
+) -> tuple[float, str]:
+    """
+    過去走の日付(date)から今回のレースまでの間隔と「休み明け何走目か」を自動判定。
+    ・黄金ローテ「叩き2走目」(2走前〜前走が60日以上休養 ➔ 今回中2〜6週): 1.025〜1.035倍
+    ・順調な「叩き3走目」: 1.015〜1.020倍
+    ・好間隔(中3〜6週): 1.010倍
+    ・半年以上の長期休養明け / 連闘・中1週の長距離強行軍: 0.965〜0.985倍
+    """
+    records = get_active_horse_records(bamei)
+    if not records:
+        return 1.00, "初出走/履歴なし"
+
+    dated_recs = []
+    for r in records:
+        dt = parse_date_str(r.get("date", ""))
+        if dt is not None:
+            dated_recs.append((dt, r))
+
+    if not dated_recs:
+        return 1.00, "ローテ標準"
+
+    dated_recs.sort(key=lambda x: x[0])
+    last_dt, last_rec = dated_recs[-1]
+
+    if target_race_date is None or target_race_date <= last_dt:
+        # 過去レース検証等でtarget_race_dateが取得できなかった場合の推定
+        if len(dated_recs) >= 2:
+            prev_dt, _ = dated_recs[-2]
+            prev_gap = (last_dt - prev_dt).days
+            if prev_gap >= 65:
+                mult = 1.032 if power_score >= 0.74 else 1.022
+                return mult, "🔄叩き2走目(上昇◎)"
+        return 1.00, "順調"
+
+    days_since_last = (target_race_date - last_dt).days
+    weeks_approx = max(1, round(days_since_last / 7.0)) - 1
+
+    # 2走前と前走の間隔（前走が休み明けだったかどうかの判定）
+    gap_before_last = 0
+    if len(dated_recs) >= 2:
+        prev2_dt, _ = dated_recs[-2]
+        gap_before_last = (last_dt - prev2_dt).days
+
+    gap_before_prev2 = 0
+    if len(dated_recs) >= 3:
+        prev3_dt, _ = dated_recs[-3]
+        gap_before_prev2 = (dated_recs[-2][0] - prev3_dt).days
+
+    last_cf = infer_class_factor(last_rec)
+
+    # パターン1: 黄金の「休み明け叩き2走目」（前走が60日以上の休み明け ➔ 今回が18〜52日間隔）
+    if gap_before_last >= 60 and 18 <= days_since_last <= 52:
+        if power_score >= 0.75 or last_cf >= 1.04:
+            return 1.035, f"🔄叩き2走目・中{weeks_approx}週(本番上昇◎)"
+        return 1.022, f"🔄叩き2走目・中{weeks_approx}週(上積み○)"
+
+    # パターン2: 走り頃の「叩き3走目」（2走前が60日以上の休み明け ➔ 前走18〜45日 ➔ 今回18〜50日）
+    if gap_before_prev2 >= 60 and 18 <= gap_before_last <= 48 and 18 <= days_since_last <= 52:
+        return 1.018, f"🔄叩き3走目・中{weeks_approx}週(充実期○)"
+
+    # パターン3: 長期休養明け（150日＝約5ヶ月以上ぶっつけ）
+    if days_since_last >= 150:
+        if power_score >= 0.80:
+            return 0.990, f"鉄砲・休養明け({days_since_last}日ぶり)"
+        return 0.965, f"⚠️長期休養明け({days_since_last}日ぶり)"
+
+    # パターン4: 中期休み明け（70〜149日ぶり）
+    if 70 <= days_since_last < 150:
+        if power_score >= 0.78:
+            return 1.005, f"休み明け・中{weeks_approx}週(外厩仕上)"
+        return 0.985, f"休み明け({days_since_last}日ぶり)"
+
+    # パターン5: 間隔詰まり（連闘〜中1週＝14日以内）
+    if days_since_last <= 14:
+        if target_distance >= 2200:
+            return 0.970, f"⚠️間隔詰まり(中{max(0, weeks_approx)}週・長距離)"
+        return 0.990, f"間隔詰まり(中{max(0, weeks_approx)}週)"
+
+    # パターン6: 標準的な好ローテ（中2週〜中7週）
+    if 21 <= days_since_last <= 52:
+        return 1.010, f"好ローテ(中{weeks_approx}週)"
+
+    return 1.000, f"中{weeks_approx}週"
 
 
 def calc_jra_wakuban(umaban: int, total_horses: int) -> int:
@@ -1218,16 +1305,9 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
 
 
 def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]:
-    title_m = re.search(r'<title>(.*?)</title>', shutuba_html, re.IGNORECASE | re.DOTALL)
-    if title_m:
-        t_str = title_m.group(1)
-        d_m = re.search(r'(20\d{2})年\s*(\d{1,2})月\s*(\d{1,2})日', t_str)
-        if d_m:
-            try:
-                dt = datetime(int(d_m.group(1)), int(d_m.group(2)), int(d_m.group(3)))
-                return dt.weekday()
-            except:
-                pass
+    dt = extract_target_race_date(shutuba_html)
+    if dt is not None:
+        return dt.weekday()
 
     act_m = re.search(r'<dd[^>]*class="[^"]*Active[^"]*"[^>]*>(.*?)</dd>', shutuba_html, re.IGNORECASE | re.DOTALL)
     if act_m:
@@ -1396,6 +1476,9 @@ class HorseData(BaseModel):
     weight_change: float = 0.0  
     condition_override: str = "1.00"
     condition_reason: Optional[str] = ""
+    training_rank: Optional[str] = "B"
+    rotation_mult: Optional[float] = 1.00
+    rotation_label: Optional[str] = ""
     zenso_chakujun: float = 8.0
     avg_agari: float = 35.0
     kyakushitsu: float = 2.0  
@@ -1440,6 +1523,8 @@ def fetch_race(race_id: str):
     try:
         title_match = re.search(r'<title>(.*?)</title>', html)
         race_name = title_match.group(1).split("|")[0].strip() if title_match else "レース不明"
+        target_race_date = extract_target_race_date(html)
+
         place_code = race_id[4:6] if len(race_id) >= 6 else '05'
         place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
         place_name = place_dict.get(place_code, "地方/海外")
@@ -1484,7 +1569,7 @@ def fetch_race(race_id: str):
             except:
                 continue
 
-        # ★ アプローチ①＋③: サーバーDB（過去全キャリア）＋ shutuba_past.html（直近5走＆父・母父血統）をハイブリッドマージ
+        # ★ アプローチ①＋③＋④: サーバーDB（過去全キャリア）＋ shutuba_past.html（直近5走・着差・上がり順位・血統・日付）をハイブリッドマージ
         past_merged_ok, merged_cnt = fetch_and_merge_shutuba_past(race_id, headers, bamei_list)
 
         # ★ 終了レース(HTML形式) ＆ 未来レース(JavaScript動的API形式) のハイブリッドオッズ取得
@@ -1513,6 +1598,7 @@ def fetch_race(race_id: str):
             except: return 2.0
 
         any_weight_announced = False
+        tataki2_count = 0
 
         for block in horse_blocks:
             try:
@@ -1592,11 +1678,24 @@ def fetch_race(race_id: str):
                     bamei, weight_val, change_val, weight_announced, zenso, power_score, kaisuu
                 )
 
-                # ★アプローチ③: 血統＆距離・道悪適性ラベルを自動判定根拠に付与
+                # ★アプローチ③: 血統＆距離・道悪適性ラベル
                 _, _, ped_summary = evaluate_pedigree_and_distance_aptitude(
                     bamei, track_type, distance, track_condition, 9.0
                 )
-                combined_reason = f"{auto_cond_reason} / {ped_summary}" if ped_summary else auto_cond_reason
+
+                # ★アプローチ④: ローテーション（叩き2走目・3走目・レース間隔）自動算出
+                rot_mult, rot_label = evaluate_rotation_aptitude(
+                    bamei, target_race_date, power_score, distance
+                )
+                if "叩き2走目" in rot_label:
+                    tataki2_count += 1
+
+                reason_parts = [auto_cond_reason]
+                if rot_label:
+                    reason_parts.append(rot_label)
+                if ped_summary:
+                    reason_parts.append(ped_summary)
+                combined_reason = " / ".join(reason_parts)
 
                 horses_data.append({
                     "wakuban": wakuban,
@@ -1605,6 +1704,9 @@ def fetch_race(race_id: str):
                     "bataijuu": weight_val, "weight_change": change_val, 
                     "condition_override": auto_cond_code,
                     "condition_reason": combined_reason,
+                    "training_rank": "B",
+                    "rotation_mult": round(rot_mult, 3),
+                    "rotation_label": rot_label,
                     "zenso_chakujun": zenso, "avg_agari": agari,
                     "kyakushitsu": get_auto_kyakushitsu(bamei),
                     "shussou_kaisuu": kaisuu,
@@ -1626,13 +1728,13 @@ def fetch_race(race_id: str):
         auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
         auto_bias, auto_strength, bias_status, bias_msg = auto_detect_track_bias(race_id, track_type, html)
 
-        db_merge_note = f" [＋5走柱＆血統統合:{merged_cnt}頭]" if past_merged_ok else " [サーバーDB＋血統辞書使用]"
+        db_merge_note = f" [5走柱・血統・ローテ統合:{merged_cnt}頭 / 叩き2走目:{tataki2_count}頭]" if past_merged_ok else " [サーバーDB＋血統辞書使用]"
         if any_weight_announced:
             weight_status = "auto_detected"
-            weight_msg = f"✅ 当日馬体重＆全キャリア実績・血統適性（距離延長/道悪耐性）を自動セットしました。{db_merge_note}"
+            weight_msg = f"✅ 馬体重・血統・ローテーション（叩き2走目等）を自動セットしました。追切評価(S/A/B/C)もワンタップで反映可能です。{db_merge_note}"
         else:
             weight_status = "manual_required"
-            weight_msg = f"⚠️ 当日馬体重が未発表のため『通常（補正なし）』にセットしました。{db_merge_note}"
+            weight_msg = f"ℹ️ 血統・ローテーション（叩き2走目:{tataki2_count}頭）を自動セットしました（馬体重は未発表）。追切評価(S/A/B/C)も変更可能です。{db_merge_note}"
 
         return {
             "status": "success", "race_name": race_name, "place_name": place_name,
@@ -1756,7 +1858,7 @@ def calculate_stage1_pure_score(
 def calculate_comprehensive_score(
     raw_lgb_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
     expected_pace, track_bias, bias_strength, cushion_value, course_rpci, 
-    time_limit_mult, stage2_ped_mult: float = 1.0
+    time_limit_mult, stage2_ped_mult: float = 1.0, rotation_mult: float = 1.0, training_mult: float = 1.0
 ):
     if horse.odds > 1.0:
         market_prob = min(0.55, 0.80 / float(horse.odds))
@@ -1875,10 +1977,12 @@ def calculate_comprehensive_score(
     except:
         pass
 
-    total_mult = pace_mult * bias_mult * time_limit_mult * condition_mult * stage2_ped_mult
-    capped_mult = max(0.78, min(1.24, total_mult))
+    # アプローチ④: ローテーション倍率(rotation_mult)と追い切りランク倍率(training_mult)を統合
+    combined_cond_mult = condition_mult * rotation_mult * training_mult
+    total_mult = pace_mult * bias_mult * time_limit_mult * combined_cond_mult * stage2_ped_mult
+    capped_mult = max(0.76, min(1.26, total_mult))
 
-    return base_ability * capped_mult, round(bias_mult, 3), round(pace_mult, 3), round(condition_mult, 3)
+    return base_ability * capped_mult, round(bias_mult, 3), round(pace_mult, 3), round(combined_cond_mult, 3)
 
 
 def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1890,7 +1994,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
 
     axis_horse = None
     for h in by_stage2:
-        if h.get("time_limit_mult", 1.0) >= 0.94:
+        if h.get("time_limit_mult", 1.0) >= 0.94 and h.get("training_rank", "B") != "C":
             axis_horse = h
             break
     if axis_horse is None:
@@ -1903,6 +2007,9 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         if u == axis_umaban:
             continue
         if h.get("time_limit_mult", 1.0) <= 0.88 or h.get("condition_mult", 1.0) <= 0.88:
+            continue
+        # ★アプローチ④連動: 追切評価が「C(割引・遅れ)」の馬は2列目本線から自動的に外す（危険な人気馬対策）
+        if h.get("training_rank", "B") == "C":
             continue
         if len(main_2nd_horses) < 3 and (h["shisu"] >= 53.0 or (h["myoumi"] >= 57.0 and h["shisu"] >= 50.0)):
             main_2nd_horses.append(h)
@@ -1967,7 +2074,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         elif c_mult <= 0.88:
             eliminated_umabans.add(u)
             h["role_code"] = "ELIMINATED"
-            h["role_label"] = "💀 完全消し (極端な馬体減)"
+            h["role_label"] = "💀 完全消し (極端な馬体減/状態難)"
 
     for h in horses_data:
         u = h["umaban"]
@@ -2121,10 +2228,19 @@ def diagnose_race(request: RaceRequest):
             expected_standard_time, request.cushion_value, request.track_condition
         )
 
-        # ★アプローチ③: 血統×距離延長・道悪適性の倍率を算出
-        s1_ped_mult, s2_ped_mult, _ = evaluate_pedigree_and_distance_aptitude(
+        # アプローチ③: 血統×距離延長・道悪適性の倍率
+        s1_ped_mult, s2_ped_mult, ped_label = evaluate_pedigree_and_distance_aptitude(
             horse.bamei, request.course_type, request.distance, request.track_condition, request.cushion_value
         )
+
+        # アプローチ④: ローテーション倍率 ＆ 追い切りランク倍率
+        rot_mult = float(horse.rotation_mult) if horse.rotation_mult else 1.00
+        rot_label = str(horse.rotation_label or "")
+        if rot_mult == 1.00 and not rot_label:
+            rot_mult, rot_label = evaluate_rotation_aptitude(horse.bamei, None, power_score, request.distance)
+
+        t_rank = str(horse.training_rank or "B").upper()
+        training_mult = TRAINING_RANK_MULTIPLIERS.get(t_rank, 1.00)
         
         stage1_input = pd.DataFrame([{
             '枠番': 4.0, '馬番': 8.0, '斤量': horse.kinryou, '馬体重_数値': 480.0,
@@ -2154,7 +2270,7 @@ def diagnose_race(request: RaceRequest):
         final_score, bias_mult, pace_mult, cond_mult = calculate_comprehensive_score(
             raw_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
             request.expected_pace, request.track_bias, request.bias_strength, request.cushion_value,
-            base_rpci, time_limit_mult, s2_ped_mult
+            base_rpci, time_limit_mult, s2_ped_mult, rot_mult, training_mult
         )
         
         records = get_active_horse_records(horse.bamei)[-5:]
@@ -2185,6 +2301,9 @@ def diagnose_race(request: RaceRequest):
             "base_prob": final_score, "time_diff": round(time_diff, 2),
             "pci": h_pci, "pci_type": h_pci_type,
             "bataijuu": horse.bataijuu, "weight_change": horse.weight_change,
+            "training_rank": t_rank,
+            "rotation_label": rot_label,
+            "pedigree_label": ped_label,
             "time_limit_mult": round(time_limit_mult, 2),
             "bias_mult": bias_mult,
             "pace_mult": pace_mult,
@@ -2293,6 +2412,9 @@ def simulate_race(request: RaceRequest):
         _, s2_ped_mult, _ = evaluate_pedigree_and_distance_aptitude(
             horse.bamei, request.course_type, request.distance, request.track_condition, request.cushion_value
         )
+        rot_mult = float(horse.rotation_mult) if horse.rotation_mult else 1.00
+        t_rank = str(horse.training_rank or "B").upper()
+        training_mult = TRAINING_RANK_MULTIPLIERS.get(t_rank, 1.00)
         
         input_data = pd.DataFrame([{
             '枠番': horse.wakuban, '馬番': horse.umaban, '斤量': horse.kinryou, '馬体重_数値': horse.bataijuu,
@@ -2309,7 +2431,7 @@ def simulate_race(request: RaceRequest):
         final_score, _, _, _ = calculate_comprehensive_score(
             raw_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
             request.expected_pace, request.track_bias, request.bias_strength, request.cushion_value,
-            base_rpci, time_limit_mult, s2_ped_mult
+            base_rpci, time_limit_mult, s2_ped_mult, rot_mult, training_mult
         )
         
         horses_data.append({
