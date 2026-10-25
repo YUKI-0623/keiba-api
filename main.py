@@ -12,9 +12,10 @@ import time
 import random
 import pickle
 import math
+import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: オッズ取得バグ完全修正/地力ブレンド/馬体重マイルド化)")
+app = FastAPI(title="競馬シミュレーションAPI (アプローチ①＋②実装版: DB×5走柱ハイブリッド統合＆重賞着差・上がり順位精密化)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +35,9 @@ with open('horse_history_db.pkl', 'rb') as f:
     
 with open('course_history_db.pkl', 'rb') as f:
     course_history_db = pickle.load(f)
+
+# リアルタイム5走柱で補強されたレコードを一時保持するインメモリキャッシュ（元のDBは破壊せず拡張）
+runtime_enriched_db: Dict[str, List[Dict[str, Any]]] = {}
 
 def safe_encode(encoder_name, value):
     if encoder_name not in encoders:
@@ -70,15 +74,24 @@ def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -
 
 def infer_class_factor(record: dict) -> float:
     """
-    DBにclass_factorが存在しない場合のフォールバック判定。
-    G1/G2等のグレード表記が無い場合でも、主要重賞名を直接判定して正確にクラス係数を付与する。
+    レース名・グレードからクラス係数を厳密判定。
+    条件戦のスコア上限を抑えるため、未勝利(0.58)・1勝(0.68)・2勝(0.78)・3勝(0.88)と段階化し、
+    G1(1.22)・G2(1.12)・G3(1.04)との格付けの差を明確化する。
     """
     if 'class_factor' in record and record['class_factor'] is not None:
         try:
-            return float(record['class_factor'])
+            val = float(record['class_factor'])
+            # 既存DBのclass_factorがある場合もG1/G2判定だけは再チェックして引き上げ漏れを防ぐ
+            r_check = str(record.get('race_name', '')) + str(record.get('grade', ''))
+            if any(k in r_check for k in ['G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞', 'ホープフル', '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC']):
+                return max(val, 1.22)
+            if any(k in r_check for k in ['G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞', 'スプリングS', 'ローズS', '紫苑S']):
+                return max(val, 1.12)
+            return val
         except:
             pass
-    r_name = str(record.get('race_name', '')) + str(record.get('grade', ''))
+
+    r_name = str(record.get('race_name', '')) + " " + str(record.get('grade', ''))
 
     g1_keywords = [
         'G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞',
@@ -98,24 +111,27 @@ def infer_class_factor(record: dict) -> float:
     ]
 
     for kw in g1_keywords:
-        if kw in r_name: return 1.20
+        if kw in r_name: return 1.22
     for kw in g2_keywords:
-        if kw in r_name: return 1.10
+        if kw in r_name: return 1.12
     for kw in g3_keywords:
-        if kw in r_name: return 1.03
+        if kw in r_name: return 1.04
 
-    if 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name or 'S' in r_name or '特別' in r_name:
-        if '3勝' in r_name or '1600万' in r_name: return 0.90
-        if '2勝' in r_name or '1000万' in r_name: return 0.80
-        if '1勝' in r_name or '500万' in r_name: return 0.70
-        return 0.96
-    if '3勝' in r_name or '1600万' in r_name: return 0.90
-    if '2勝' in r_name or '1000万' in r_name: return 0.80
-    if '1勝' in r_name or '500万' in r_name: return 0.70
-    if '未勝利' in r_name or '新馬' in r_name: return 0.60
-    return 0.75
+    if '3勝' in r_name or '1600万' in r_name: return 0.88
+    if '2勝' in r_name or '1000万' in r_name: return 0.78
+    if '1勝' in r_name or '500万' in r_name: return 0.68
+    if '未勝利' in r_name or '新馬' in r_name: return 0.58
+
+    if 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name or '賞' in r_name or '特別' in r_name:
+        return 0.94
+
+    return 0.72
 
 def infer_margin_seconds(record: dict) -> float:
+    """
+    勝ち馬との着差（秒）を返す。
+    shutuba_past.html 等から実測着差(margin)が取得できていればそれを最優先で使用。
+    """
     if 'margin' in record and record['margin'] is not None:
         try:
             val = float(record['margin'])
@@ -132,6 +148,214 @@ def infer_margin_seconds(record: dict) -> float:
         else: return 1.25
     except:
         return 0.75
+
+
+# =====================================================================
+# アプローチ①: shutuba_past.html（5走柱）リアルタイム取得 ＆ 既存DBとのハイブリッドマージ
+# =====================================================================
+def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[str]) -> tuple[bool, int]:
+    """
+    netkeibaの5走柱ページ(shutuba_past.html)から直近5走の
+    「正確な着差(margin)」「上がり順位(agari_rank: 1〜3位)」「正確なグレード(G1/G2/G3)」を取得し、
+    サーバーの horse_history_db.pkl の全キャリア履歴（6走前以前含む）とハイブリッド統合する。
+    """
+    place_map_rev = {'札幌':'01', '函館':'02', '福島':'03', '新潟':'04', '東京':'05', '中山':'06', '中京':'07', '京都':'08', '阪神':'09', '小倉':'10'}
+    enriched_horse_count = 0
+
+    # まず全出走馬について、既存のDB履歴をベースとしてコピー（6走前以前の記憶を100%保持）
+    for bamei in bamei_list:
+        base_recs = copy.deepcopy(horse_history_db.get(bamei, {}).get('race_records', []))
+        runtime_enriched_db[bamei] = base_recs
+
+    try:
+        time.sleep(0.25)
+        url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code != 200:
+            return False, 0
+        res.encoding = res.apparent_encoding
+        past_html = res.text
+
+        if "Past" not in past_html and "HorseList" not in past_html:
+            return False, 0
+
+        rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', past_html, re.DOTALL | re.IGNORECASE)
+        for row in rows:
+            # 馬名の特定
+            bamei = ""
+            b_m = re.search(r'<div[^>]*class="[^"]*Horse02[^"]*"[^>]*>(.*?)</div>', row, re.IGNORECASE | re.DOTALL)
+            if not b_m:
+                b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', row, re.IGNORECASE | re.DOTALL)
+            if not b_m:
+                b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', row, re.IGNORECASE | re.DOTALL)
+            if b_m:
+                bamei = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
+            if not bamei or bamei not in runtime_enriched_db:
+                continue
+
+            past_tds = re.findall(r'<td[^>]*class="[^"]*Past[^"]*"[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if not past_tds:
+                continue
+
+            parsed_recent = []
+            # past_tds は左から [前走, 2走前, 3走前, 4走前, 5走前] の順なので、古い順(5走前->前走)に処理するためreversed
+            for p_html in reversed(past_tds):
+                p_text = re.sub(r'<[^>]*>', ' ', p_html)
+                p_text = re.sub(r'\s+', ' ', p_text).strip()
+                if not p_text or len(p_text) < 10:
+                    continue
+
+                # 1. 日付と場所
+                date_str = ""
+                m_date = re.search(r'(20\d{2}[./]\d{1,2}[./]\d{1,2})', p_text)
+                if m_date:
+                    date_str = m_date.group(1).replace('.', '/')
+
+                place_code = "05"
+                for p_name, p_c in place_map_rev.items():
+                    if p_name in p_text:
+                        place_code = p_c
+                        break
+
+                # 2. 着順
+                rank_val = None
+                m_rk = re.search(r'<span[^>]*class="[^"]*Num[^"]*"[^>]*>\s*(\d{1,2})\s*</span>', p_html, re.IGNORECASE)
+                if m_rk:
+                    rank_val = float(m_rk.group(1))
+                else:
+                    m_rk2 = re.search(r'20\d{2}[./]\d{1,2}[./]\d{1,2}\s+\S+\s+(\d{1,2})\b', p_text)
+                    if m_rk2:
+                        rank_val = float(m_rk2.group(1))
+                if rank_val is None:
+                    continue
+
+                # 3. レース名とグレード（Icon_GradeTypeクラスの検出含む）
+                grade_str = ""
+                if "Icon_GradeType1" in p_html or "(GI)" in p_text or "(G1)" in p_text or "GI" in p_text:
+                    grade_str = "G1"
+                elif "Icon_GradeType2" in p_html or "(GII)" in p_text or "(G2)" in p_text or "GII" in p_text:
+                    grade_str = "G2"
+                elif "Icon_GradeType3" in p_html or "(GIII)" in p_text or "(G3)" in p_text or "GIII" in p_text:
+                    grade_str = "G3"
+                elif "Icon_GradeType4" in p_html or "Icon_GradeType5" in p_html or "(L)" in p_text or "(OP)" in p_text:
+                    grade_str = "OP"
+
+                race_title = ""
+                m_rname = re.search(r'<div[^>]*class="[^"]*Data02[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
+                if m_rname:
+                    race_title = re.sub(r'<[^>]*>', '', m_rname.group(1)).strip()
+
+                # 4. コース・距離・走破タイム・馬場状態
+                c_type, dist_val, time_str, cond_str = "芝", 2000, "-", "良"
+                m_cd = re.search(r'(芝|ダ|障)\s*(\d{3,4})', p_text)
+                if m_cd:
+                    c_type = m_cd.group(1)
+                    dist_val = int(m_cd.group(2))
+                m_tm = re.search(r'(\d:\d{2}\.\d)', p_text)
+                if m_tm:
+                    time_str = m_tm.group(1)
+                m_cnd = re.search(r'\b(良|稍|重|不)\b', p_text)
+                if m_cnd:
+                    cond_str = m_cnd.group(1)
+
+                # 5. 通過順・上がり3F・上がり順位(1〜3位)
+                passing_str = "-"
+                m_pass = re.search(r'(\d{1,2}(?:-\d{1,2})+)', p_text)
+                if m_pass:
+                    passing_str = m_pass.group(1)
+
+                up_val = "-"
+                # 通過順付近のカッコ内または31.0〜43.0秒の小数を上がり3Fとして抽出
+                m_up = re.search(r'\((\d{2}\.\d)\)', p_text)
+                if m_up and 31.0 <= float(m_up.group(1)) <= 44.0:
+                    up_val = m_up.group(1)
+                else:
+                    for m_cand in re.finditer(r'\b(3[1-9]\.\d|4[0-3]\.\d)\b', p_text):
+                        up_val = m_cand.group(1)
+                        break
+
+                agari_rank = 99
+                if re.search(r'class="[^"]*(?:Rank_1|BgYellow)[^"]*"', p_html, re.IGNORECASE):
+                    agari_rank = 1
+                elif re.search(r'class="[^"]*(?:Rank_2|BgOrange)[^"]*"', p_html, re.IGNORECASE):
+                    agari_rank = 2
+                elif re.search(r'class="[^"]*(?:Rank_3|BgBlue|Rank_3)[^"]*"', p_html, re.IGNORECASE):
+                    agari_rank = 3
+
+                # 6. 着差(margin): Data06の「馬名(0.1)」形式から抽出
+                margin_val = None
+                m_data06 = re.search(r'<div[^>]*class="[^"]*Data06[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
+                if m_data06:
+                    d6_txt = re.sub(r'<[^>]*>', '', m_data06.group(1)).strip()
+                    m_mg = re.search(r'\(([+-]?\d+\.\d+)\)', d6_txt)
+                    if m_mg:
+                        raw_mg = float(m_mg.group(1))
+                        margin_val = 0.0 if rank_val == 1.0 or raw_mg < 0 else raw_mg
+
+                # 7. 馬体重
+                w_val = None
+                m_wt = re.search(r'(\d{3})\([+-]?\d+\)', p_text)
+                if m_wt:
+                    w_val = float(m_wt.group(1))
+
+                parsed_recent.append({
+                    "date": date_str,
+                    "course": f"{place_code}_{c_type}_{dist_val}",
+                    "race_name": race_title,
+                    "grade": grade_str,
+                    "rank": rank_val,
+                    "time": time_str,
+                    "up": up_val,
+                    "agari_rank": agari_rank,
+                    "passing": passing_str,
+                    "cond": cond_str,
+                    "margin": margin_val,
+                    "weight": w_val
+                })
+
+            if parsed_recent:
+                existing_list = runtime_enriched_db[bamei]
+                for new_r in parsed_recent:
+                    matched = False
+                    # 既存DB内のレコードと「走破タイム＋距離」または「日付」で照合し、一致すれば高解像度情報をマージ
+                    for ex_r in existing_list:
+                        same_time = (new_r["time"] != "-" and str(ex_r.get("time", "")) == new_r["time"])
+                        same_course = (new_r["course"] == str(ex_r.get("course", "")))
+                        same_rank = (int(new_r["rank"]) == int(float(ex_r.get("rank", 99))))
+                        if (same_time and same_course) or (same_course and same_rank and new_r["up"] == str(ex_r.get("up", ""))):
+                            if new_r["margin"] is not None:
+                                ex_r["margin"] = new_r["margin"]
+                            if new_r["grade"]:
+                                ex_r["grade"] = new_r["grade"]
+                            if new_r["race_name"] and not ex_r.get("race_name"):
+                                ex_r["race_name"] = new_r["race_name"]
+                            if new_r["agari_rank"] <= 3:
+                                ex_r["agari_rank"] = new_r["agari_rank"]
+                            if new_r["weight"] and not ex_r.get("weight"):
+                                ex_r["weight"] = new_r["weight"]
+                            matched = True
+                            break
+                    # DBに未収録の最新レースであれば末尾に追加
+                    if not matched:
+                        existing_list.append(new_r)
+
+                runtime_enriched_db[bamei] = existing_list
+                enriched_horse_count += 1
+
+        return enriched_horse_count > 0, enriched_horse_count
+    except Exception:
+        return False, 0
+
+
+def get_active_horse_records(bamei_str: str) -> List[Dict[str, Any]]:
+    """
+    ハイブリッド統合済みの履歴があればそれを返し、無ければサーバーの horse_history_db.pkl を返す。
+    これにより6走前以前の過去全キャリア＋直近5走の高解像度データが常に揃う。
+    """
+    if bamei_str in runtime_enriched_db and runtime_enriched_db[bamei_str]:
+        return runtime_enriched_db[bamei_str]
+    return horse_history_db.get(bamei_str, {}).get('race_records', [])
+
 
 def calc_jra_wakuban(umaban: int, total_horses: int) -> int:
     if total_horses <= 8:
@@ -170,7 +394,7 @@ def get_pci_label(pci_val):
     else: return "C"
 
 def get_horse_pci_stats(bamei_str):
-    records = horse_history_db.get(bamei_str, {}).get('race_records', [])
+    records = get_active_horse_records(bamei_str)
     if not records: return 50.0, "B"
     good_pcis = []
     all_pcis = []
@@ -187,8 +411,18 @@ def get_horse_pci_stats(bamei_str):
     avg_pci = round(float(np.mean(target_pcis)), 1)
     return avg_pci, get_pci_label(avg_pci)
 
+
+# =====================================================================
+# アプローチ②: 全キャリア(6走前以前含む)スキャン × G1/重賞僅差フロア保証 × 上がり順位ボーナス
+# =====================================================================
 def get_horse_real_stats(bamei_str):
-    records = horse_history_db.get(bamei_str, {}).get('race_records', [])
+    """
+    1. サーバーDB＋5走柱の統合レコードから最大12走（6走前以前のG1・重賞好走も含む）をスキャン。
+    2. 未勝利・1勝クラスのスコア上限を 0.72 に制限し、条件戦のまぐれ馬がピーク値で浮上するのを完全防止。
+    3. 逆にG1で0.4秒差以内(または3着以内)、G2で0.2秒差以内(または2着以内)の実績馬にはフロア値(下限保証)を適用。
+    4. 上がり順位(1〜3位)および重賞での鋭い末脚に「上がり最速ボーナス」を付与。
+    """
+    records = get_active_horse_records(bamei_str)
     if not records: return 8.0, 35.0, 0, 0.5, False
     
     shussou_kaisuu = len(records)
@@ -207,12 +441,18 @@ def get_horse_real_stats(bamei_str):
 
     makuri_flag = False
     recent_scores = []
-    all_valid_scores = []
+    career_scores = []
+    graded_floor_score = 0.0
+    agari_rank_bonus = 0.0
     
-    scan_records = records[-7:]
+    # 6走前以前の好走も確実にとらえるため、過去最大12走をスキャン
+    scan_records = records[-12:]
+    recent_start_idx = max(0, len(scan_records) - 5)
+
     for idx, r in enumerate(scan_records):
+        is_recent_5 = (idx >= recent_start_idx)
         passing = str(r.get('passing', ''))
-        if '-' in passing and idx >= len(scan_records) - 5:
+        if '-' in passing and is_recent_5:
             try:
                 p_nums = [int(x) for x in passing.split('-') if x.isdigit()]
                 if len(p_nums) >= 2 and (p_nums[0] - p_nums[-1]) >= 3:
@@ -221,6 +461,10 @@ def get_horse_real_stats(bamei_str):
 
         cf = infer_class_factor(r)
         margin = infer_margin_seconds(r)
+        try:
+            rk = float(r.get('rank', 99))
+        except:
+            rk = 99.0
         
         course_str = str(r.get('course', ''))
         dist = 2000.0
@@ -230,26 +474,67 @@ def get_horse_real_stats(bamei_str):
             
         capped_margin = min(max(margin, 0.0), 2.0)
         adjusted_margin = capped_margin * (2000.0 / dist) if dist > 0 else capped_margin
-        run_score = float(np.clip(cf - (adjusted_margin * 0.14), 0.10, 1.20))
-        all_valid_scores.append(run_score)
-        if idx >= len(scan_records) - 5:
+        run_score = float(np.clip(cf - (adjusted_margin * 0.14), 0.10, 1.22))
+
+        # ★重要: 条件戦(未勝利・新馬・1勝クラス: cf <= 0.68)はどんなに圧勝してもスコア上限を 0.72 に制限（まぐれ浮上防止）
+        if cf <= 0.68:
+            run_score = min(run_score, 0.72)
+        elif cf <= 0.78:  # 2勝クラス上限
+            run_score = min(run_score, 0.80)
+
+        # ★重要: G1・G2で僅差好走した実績馬のフロア（下限保証）判定（6走前以前でも有効）
+        if cf >= 1.20:  # G1
+            if rk <= 3.0 or margin <= 0.2:
+                graded_floor_score = max(graded_floor_score, 0.85)
+            elif rk <= 5.0 or margin <= 0.4:
+                graded_floor_score = max(graded_floor_score, 0.81)
+        elif cf >= 1.10:  # G2
+            if rk <= 1.0 or margin <= 0.1:
+                graded_floor_score = max(graded_floor_score, 0.82)
+            elif rk <= 3.0 or margin <= 0.3:
+                graded_floor_score = max(graded_floor_score, 0.77)
+
+        # ★アプローチ②: 上がり順位(1〜3位)または重賞級での鬼脚(PCI>=53.5かつ好走)ボーナス
+        ag_rk = int(r.get('agari_rank', 99))
+        single_pci = calc_single_pci(course_str, r.get('time', ''), r.get('up', ''))
+        if ag_rk == 1:
+            weight_mult = 1.2 if cf >= 1.00 else 0.7
+            agari_rank_bonus += 0.018 * weight_mult
+        elif ag_rk in [2, 3]:
+            weight_mult = 1.1 if cf >= 1.00 else 0.6
+            agari_rank_bonus += 0.010 * weight_mult
+        elif single_pci is not None and single_pci >= 53.5 and rk <= 4.0 and cf >= 1.00:
+            # DBのみでagari_rankが無い場合でも、重賞でPCI 53.5以上の鋭い脚で4着以内なら上がりボーナス付与
+            agari_rank_bonus += 0.016
+
+        career_scores.append(run_score)
+        if is_recent_5:
             recent_scores.append(run_score)
 
+    agari_rank_bonus = min(agari_rank_bonus, 0.055)
+
     if recent_scores:
-        weights = np.linspace(1.0, 2.6, len(recent_scores))
+        weights = np.linspace(1.0, 2.5, len(recent_scores))
         recent_weighted = float(np.average(recent_scores, weights=weights))
         
-        sorted_scores = sorted(all_valid_scores, reverse=True)
-        if len(sorted_scores) >= 2:
-            top2_peak = float(np.mean(sorted_scores[:2]))
+        # 全キャリア（最大12走）の上位2走平均をピーク実績値とする（6走前以前の好走もここで救済）
+        sorted_career = sorted(career_scores, reverse=True)
+        if len(sorted_career) >= 2:
+            top2_peak = float(np.mean(sorted_career[:2]))
         else:
-            top2_peak = sorted_scores[0]
+            top2_peak = sorted_career[0]
             
-        power_score = (recent_weighted * 0.75) + (top2_peak * 0.25)
+        base_power = (recent_weighted * 0.72) + (top2_peak * 0.28)
+        # G1/G2で僅差好走実績がある馬が、直近の凡走で不当に沈みすぎないようフロア保証とブレンド
+        if graded_floor_score > base_power:
+            base_power = (base_power * 0.45) + (graded_floor_score * 0.55)
+
+        power_score = float(np.clip(base_power + agari_rank_bonus, 0.15, 1.25))
     else:
         power_score = 0.50
 
     return raw_zenso, avg_agari, shussou_kaisuu, power_score, makuri_flag
+
 
 def get_course_rpci_stats(course_key):
     c_stats = course_history_db.get(course_key, {})
@@ -276,18 +561,11 @@ def adjust_pace_times(expected_pace, avg_pace_f, avg_pace_l, avg_req_up):
 
 
 # =====================================================================
-# 完全修正版: 終了レース(HTML形式) ＆ 未来レース(JavaScript API形式) オッズ取得
-# （1列目のResult_Num[着順]や2列目のWaku[枠番]との混同バグを完全排除）
+# 終了レース(HTML形式) ＆ 未来レース(JavaScript API形式) オッズ取得
 # =====================================================================
 def parse_finished_race_html_odds(
     result_html: str, bamei_to_umaban: Optional[Dict[str, int]] = None
 ) -> tuple[Dict[int, float], Dict[int, tuple[float, float]]]:
-    """
-    【終了した過去レース用: HTML形式】
-    result.html の結果テーブル(<tr class="HorseList">)から「馬番」ごとの確定単勝オッズと馬体重を抽出する。
-    ※ 1列目(Result_Num=着順)、2列目(Waku=枠番)を誤って馬番にしないよう、
-       3列目(tds[2])および馬名照合(bamei_to_umaban)で厳密に馬番を特定する。
-    """
     odds_map: Dict[int, float] = {}
     weight_map: Dict[int, tuple[float, float]] = {}
 
@@ -306,7 +584,6 @@ def parse_finished_race_html_odds(
 
             umaban = 0
 
-            # 方法1: 馬名から出馬表の馬番辞書(bamei_to_umaban)と照合（最も確実・100%ズレない）
             if bamei_to_umaban:
                 b_m = re.search(r'<span[^>]*class="[^"]*Horse_Name[^"]*"[^>]*>(.*?)</span>', row, re.IGNORECASE | re.DOTALL)
                 if not b_m:
@@ -316,7 +593,6 @@ def parse_finished_race_html_odds(
                     if b_clean in bamei_to_umaban:
                         umaban = bamei_to_umaban[b_clean]
 
-            # 方法2: result.htmlの列構造では [0]=着順(Result_Num), [1]=枠番(Waku), [2]=馬番(Num Txt_C)
             if umaban == 0 and len(tds) >= 3:
                 cand_umaban = re.sub(r'<[^>]*>', '', tds[2]).strip()
                 if cand_umaban.isdigit():
@@ -324,7 +600,6 @@ def parse_finished_race_html_odds(
                     if 1 <= u_val <= 18:
                         umaban = u_val
 
-            # 方法3: クラス名が "Num Txt_C" (Result_NumやWakuを含まない) のtdから取得
             if umaban == 0:
                 u_m = re.search(
                     r'<td[^>]*class="\s*(?:Num\s+Txt_C|Txt_C\s+Num|Umaban)\s*"[^>]*>(.*?)</td>',
@@ -338,8 +613,6 @@ def parse_finished_race_html_odds(
             if umaban == 0:
                 continue
 
-            # 単勝オッズの抽出:
-            # result.htmlでは <td class="Odds Txt_R"> に単勝オッズ（小数点付き）、<td class="Odds BgYellow">等に人気（整数）が入る
             odds_val = None
             o_m = re.search(r'<td[^>]*class="[^"]*Odds\s+Txt_R[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if o_m:
@@ -349,7 +622,6 @@ def parse_finished_race_html_odds(
                     odds_val = float(m_fl.group(1))
 
             if odds_val is None:
-                # クラスにOddsを含むセルのうち、小数点（\d+\.\d+）を持つセルだけを抽出（整数の「人気」を除外）
                 odds_cells = re.findall(r'<td[^>]*class="[^"]*Odds[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
                 for cell in odds_cells:
                     c_txt = re.sub(r'<[^>]*>', '', cell).strip().replace(',', '')
@@ -359,7 +631,6 @@ def parse_finished_race_html_odds(
                         break
 
             if odds_val is None and len(tds) >= 11:
-                # フォールバック: 11列目(tds[10])が単勝オッズ列（12列目tds[11]は後3Fなので除外）
                 for idx_td in [10, 9]:
                     if idx_td < len(tds):
                         c_txt = re.sub(r'<[^>]*>', '', tds[idx_td]).strip().replace(',', '')
@@ -372,7 +643,6 @@ def parse_finished_race_html_odds(
             if odds_val is not None and odds_val >= 1.0:
                 odds_map[umaban] = odds_val
 
-            # 確定馬体重の抽出
             w_m = re.search(r'<td[^>]*class="[^"]*Weight[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if w_m:
                 w_str = re.sub(r'<[^>]*>', '', w_m.group(1)).strip()
@@ -386,11 +656,6 @@ def parse_finished_race_html_odds(
 
 
 def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, float], str]:
-    """
-    【未来のレース・馬券購入可能後のレース用: JavaScript動的API形式 ＋ スマホ版オッズページ補完】
-    1. api_get_jra_odds.html (action=init / update) から馬番キー("01"〜"18" または "1"〜"18")の単勝オッズを取得
-    2. 万が一APIが空の場合は race.sp.netkeiba.com/?pid=odds_view&type=b1 から取得
-    """
     odds_map: Dict[int, float] = {}
     js_headers = {
         'User-Agent': headers.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'),
@@ -454,7 +719,6 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
             return odds_map, "js_yoso"
         return odds_map, "js_realtime"
 
-    # バックアップ: スマホ版単勝オッズ一覧ページから馬番とオッズを取得
     try:
         time.sleep(0.2)
         sp_url = f"https://race.sp.netkeiba.com/?pid=odds_view&type=b1&race_id={race_id}"
@@ -484,11 +748,6 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
 def fetch_hybrid_odds_and_result_weights(
     race_id: str, shutuba_html: str, headers: dict, bamei_to_umaban: Optional[Dict[str, int]] = None
 ) -> tuple[Dict[int, float], Dict[int, tuple[float, float]], str, str]:
-    """
-    1. 終了した過去レースなら result.html (HTML形式) から確定単勝オッズを取得（馬名・3列目馬番で厳密照合）
-    2. 未来/当日発走前のレースなら JavaScript動的API (api_get_jra_odds.html) からリアルタイム単勝オッズを取得
-    """
-    # 1. まずレース結果ページ(result.html)を確認し、終了レースならHTML形式で取得
     try:
         time.sleep(0.2)
         res_result = requests.get(
@@ -508,7 +767,6 @@ def fetch_hybrid_odds_and_result_weights(
     except:
         pass
 
-    # 予備: 古い過去レース等で db.netkeiba.com 側に結果HTMLがある場合
     try:
         if len(race_id) == 12 and int(race_id[:4]) < datetime.now().year:
             time.sleep(0.2)
@@ -534,7 +792,6 @@ def fetch_hybrid_odds_and_result_weights(
     except:
         pass
 
-    # 2. 終了レースではない場合 ➔ 未来/当日発走前レースとしてJavaScript動的API形式で取得
     js_odds, js_mode = fetch_future_race_js_odds(race_id, headers)
     if len(js_odds) >= 2:
         if js_mode == "js_yoso":
@@ -551,7 +808,6 @@ def fetch_hybrid_odds_and_result_weights(
             f"✅ オッズ自動取得 [未来/当日レース・JS形式]: JavaScript動的APIから最新単勝オッズ（{len(js_odds)}頭）を反映しました。"
         )
 
-    # 3. フォールバック: shutuba.html 内に直接埋め込まれているオッズがあれば抽出
     inline_odds: Dict[int, float] = {}
     for m_in in re.finditer(r'id="odds-1_0*(\d+)"[^>]*>\s*(\d+\.\d+)\s*<', shutuba_html):
         try:
@@ -581,7 +837,7 @@ def infer_auto_condition_override(
     if not weight_announced:
         return "1.00", "馬体重未発表（手動設定可）"
 
-    records = horse_history_db.get(bamei, {}).get('race_records', [])
+    records = get_active_horse_records(bamei)
     good_weights = []
     for r in records:
         try:
@@ -971,8 +1227,8 @@ def fetch_race(race_id: str):
 
         horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
 
-        # まず出馬表から「馬名 -> 馬番」の正確な辞書を作成（result.htmlでの着順誤認を100%防ぐため）
         bamei_to_umaban: Dict[str, int] = {}
+        bamei_list: List[str] = []
         for block in horse_blocks:
             try:
                 u_num = 0
@@ -987,8 +1243,12 @@ def fetch_race(race_id: str):
                     b_str = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
                     if b_str:
                         bamei_to_umaban[b_str] = u_num
+                        bamei_list.append(b_str)
             except:
                 continue
+
+        # ★ アプローチ①: サーバーDB（過去全キャリア）＋ shutuba_past.html（直近5走の着差・上がり順位・グレード）をハイブリッドマージ
+        past_merged_ok, merged_cnt = fetch_and_merge_shutuba_past(race_id, headers, bamei_list)
 
         # ★ 終了レース(HTML形式) ＆ 未来レース(JavaScript動的API形式) のハイブリッドオッズ取得
         hybrid_odds_map, result_weight_map, odds_status, odds_msg = fetch_hybrid_odds_and_result_weights(
@@ -999,7 +1259,7 @@ def fetch_race(race_id: str):
         
         def get_auto_kyakushitsu(bamei_str):
             try:
-                records = horse_history_db.get(bamei_str, {}).get('race_records', [])
+                records = get_active_horse_records(bamei_str)
                 if not records: return 2.0
                 last_corners = []
                 for r in records[-5:]:
@@ -1123,12 +1383,13 @@ def fetch_race(race_id: str):
         auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
         auto_bias, auto_strength, bias_status, bias_msg = auto_detect_track_bias(race_id, track_type, html)
 
+        db_merge_note = f" [＋5走柱リアルタイム統合:{merged_cnt}頭]" if past_merged_ok else " [サーバーDB履歴使用]"
         if any_weight_announced:
             weight_status = "auto_detected"
-            weight_msg = "✅ 当日馬体重の増減と過去好走実績から、全頭の『状態補正（本番引き締め・成長分・細化注意等）』をマイルド設定で自動セットしました。"
+            weight_msg = f"✅ 当日馬体重＆全キャリア実績（G1/重賞着差・上がり順位）から状態補正を自動セットしました。{db_merge_note}"
         else:
             weight_status = "manual_required"
-            weight_msg = "⚠️ 当日馬体重が未発表のため『通常（補正なし）』にセットしました。発表後または手動で設定してください。"
+            weight_msg = f"⚠️ 当日馬体重が未発表のため『通常（補正なし）』にセットしました。{db_merge_note}"
 
         return {
             "status": "success", "race_name": race_name, "place_name": place_name,
@@ -1163,7 +1424,7 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
     if current_distance >= 2500:
         return 1.00 
 
-    h_records = horse_history_db.get(horse_name, {}).get('race_records', [])
+    h_records = get_active_horse_records(horse_name)
     if not h_records:
         return 1.00 
 
@@ -1243,7 +1504,7 @@ def calculate_stage1_pure_score(raw_lgb_pred_neutral: float, horse: HorseData, p
     elif time_diff_base <= 0.0: agari_factor = 1.01
     elif time_diff_base >= 0.6: agari_factor = 0.97
 
-    pure_ability = ((raw_lgb_pred_neutral * 0.38) + (power_score * 0.44) + (market_prob * 0.18)) * agari_factor
+    pure_ability = ((raw_lgb_pred_neutral * 0.36) + (power_score * 0.46) + (market_prob * 0.18)) * agari_factor
     return float(pure_ability)
 
 
@@ -1257,9 +1518,9 @@ def calculate_comprehensive_score(
     else: market_prob = 0.08
 
     if expected_pace in ["M_JIRIKI", "M"]:
-        base_ability = (raw_lgb_pred * 0.40) + (power_score * 0.40) + (market_prob * 0.20)
+        base_ability = (raw_lgb_pred * 0.38) + (power_score * 0.42) + (market_prob * 0.20)
     else:
-        base_ability = (raw_lgb_pred * 0.44) + (power_score * 0.36) + (market_prob * 0.20)
+        base_ability = (raw_lgb_pred * 0.42) + (power_score * 0.38) + (market_prob * 0.20)
 
     kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
@@ -1602,7 +1863,7 @@ def diagnose_race(request: RaceRequest):
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
 
-        effective_zenso_for_lgb = min(zenso, 6.0) if power_score >= 0.78 else zenso
+        effective_zenso_for_lgb = min(zenso, 5.0) if power_score >= 0.77 else zenso
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
@@ -1644,10 +1905,10 @@ def diagnose_race(request: RaceRequest):
             base_rpci, time_limit_mult
         )
         
-        records = h_stats.get('race_records', [])[-5:]
+        records = get_active_horse_records(horse.bamei)[-5:]
         history_details = []
         for r in reversed(records):
-            p_code = str(r.get('race_id', ''))[4:6]
+            p_code = str(r.get('course', '05_芝_2000')).split('_')[0]
             place = place_dict.get(p_code, "地方")
             try:
                 c_type = str(r['course']).split('_')[1]
@@ -1766,7 +2027,7 @@ def simulate_race(request: RaceRequest):
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
-        effective_zenso_for_lgb = min(zenso, 6.0) if power_score >= 0.78 else zenso
+        effective_zenso_for_lgb = min(zenso, 5.0) if power_score >= 0.77 else zenso
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
