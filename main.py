@@ -14,7 +14,7 @@ import pickle
 import math
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: 当日・前日バイアス自動切替/ハイブリッドオッズ/2段階指数)")
+app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: 地力ブレンド最適化/馬体重補正マイルド化/ハイブリッドオッズ)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,16 +69,46 @@ def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -
     return round(distance * sec_per_meter, 1)
 
 def infer_class_factor(record: dict) -> float:
-    """DBにclass_factorが存在しない場合のフォールバック判定"""
+    """
+    DBにclass_factorが存在しない場合のフォールバック判定。
+    G1/G2等のグレード表記が無い場合でも、主要重賞名を直接判定して正確にクラス係数を付与する。
+    """
     if 'class_factor' in record and record['class_factor'] is not None:
         try:
             return float(record['class_factor'])
         except:
             pass
     r_name = str(record.get('race_name', '')) + str(record.get('grade', ''))
-    if 'G1' in r_name or 'GI' in r_name: return 1.20
-    if 'G2' in r_name or 'GII' in r_name: return 1.10
-    if 'G3' in r_name or 'GIII' in r_name or 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name: return 1.00
+
+    g1_keywords = [
+        'G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞',
+        '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC', 'ジャパンカップ', 'ホープフル',
+        '朝日杯', '阪神JF', 'NHKマイル', '安田記念', 'マイルCS', 'スプリンターズ',
+        '高松宮記念', 'ヴィクトリア', 'エリザベス女王', '大阪杯', 'フェブラリー', 'チャンピオンズ'
+    ]
+    g2_keywords = [
+        'G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞',
+        'スプリングS', 'ローズS', '紫苑S', 'フローラS', 'チューリップ', '毎日王冠',
+        '京都大賞典', 'オールカマー', '札幌記念', '日経賞', '阪神大賞典', '日経新春', '金鯱賞', '東スポ杯'
+    ]
+    g3_keywords = [
+        'G3', 'GIII', '共同通信', 'きさらぎ', '京成杯', 'シンザン', 'フェアリー',
+        'クイーンC', '毎日杯', 'フラワーC', 'ファルコン', 'アーリントン', 'ラジオNIKKEI',
+        'レパード', 'ユニコーン', '新潟記念', '小倉記念', '七夕賞', 'エプソム'
+    ]
+
+    for kw in g1_keywords:
+        if kw in r_name: return 1.20
+    for kw in g2_keywords:
+        if kw in r_name: return 1.10
+    for kw in g3_keywords:
+        if kw in r_name: return 1.03
+
+    if 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name or 'S' in r_name or '特別' in r_name:
+        if '3勝' in r_name or '1600万' in r_name: return 0.90
+        if '2勝' in r_name or '1000万' in r_name: return 0.80
+        if '1勝' in r_name or '500万' in r_name: return 0.70
+        return 0.96
     if '3勝' in r_name or '1600万' in r_name: return 0.90
     if '2勝' in r_name or '1000万' in r_name: return 0.80
     if '1勝' in r_name or '500万' in r_name: return 0.70
@@ -96,12 +126,13 @@ def infer_margin_seconds(record: dict) -> float:
     try:
         rank = float(record.get('rank', 8.0))
         if rank <= 1.0: return 0.0
-        elif rank <= 3.0: return 0.2
-        elif rank <= 5.0: return 0.5
-        elif rank <= 8.0: return 0.8
-        else: return 1.3
+        elif rank <= 2.0: return 0.15
+        elif rank <= 3.0: return 0.25
+        elif rank <= 5.0: return 0.45
+        elif rank <= 8.0: return 0.75
+        else: return 1.25
     except:
-        return 0.8
+        return 0.75
 
 def calc_jra_wakuban(umaban: int, total_horses: int) -> int:
     """JRA公式ルールに基づく頭数別の正確な枠番算出フォールバック"""
@@ -159,12 +190,21 @@ def get_horse_pci_stats(bamei_str):
     return avg_pci, get_pci_label(avg_pci)
 
 def get_horse_real_stats(bamei_str):
+    """
+    【改良版地力算出】
+    ・直近5走の勢い（加重平均）: 75%
+    ・過去走の上位2走平均（Top-2 Peak Average）: 25%
+    1回だけのまぐれ（フロック）で実力のない馬が浮上するのを防ぎつつ、
+    ダービーや重賞で実績のある馬が前走の1敗だけで最下位付近に沈む現象を防ぐ。
+    """
     records = horse_history_db.get(bamei_str, {}).get('race_records', [])
     if not records: return 8.0, 35.0, 0, 0.5, False
     
     shussou_kaisuu = len(records)
-    try: zenso_chakujun = float(records[-1].get('rank', 8.0))
-    except: zenso_chakujun = 8.0
+    try:
+        raw_zenso = float(records[-1].get('rank', 8.0))
+    except:
+        raw_zenso = 8.0
     
     up_list = []
     for r in records[-3:]:
@@ -175,11 +215,14 @@ def get_horse_real_stats(bamei_str):
     avg_agari = round(float(np.mean(up_list)), 2) if up_list else 35.0
 
     makuri_flag = False
-    class_based_scores = []
+    recent_scores = []
+    all_valid_scores = []
     
-    for r in records[-5:]:
+    # 過去最大7走までスキャンしてTop-2実績を把握、直近5走で勢いを算出
+    scan_records = records[-7:]
+    for idx, r in enumerate(scan_records):
         passing = str(r.get('passing', ''))
-        if '-' in passing:
+        if '-' in passing and idx >= len(scan_records) - 5:
             try:
                 p_nums = [int(x) for x in passing.split('-') if x.isdigit()]
                 if len(p_nums) >= 2 and (p_nums[0] - p_nums[-1]) >= 3:
@@ -197,16 +240,29 @@ def get_horse_real_stats(bamei_str):
             
         capped_margin = min(max(margin, 0.0), 2.0)
         adjusted_margin = capped_margin * (2000.0 / dist) if dist > 0 else capped_margin
-        run_score = float(np.clip(cf - (adjusted_margin * 0.15), 0.10, 1.20))
-        class_based_scores.append(run_score)
+        run_score = float(np.clip(cf - (adjusted_margin * 0.14), 0.10, 1.20))
+        all_valid_scores.append(run_score)
+        if idx >= len(scan_records) - 5:
+            recent_scores.append(run_score)
 
-    if class_based_scores:
-        weights = np.arange(1, len(class_based_scores) + 1)
-        power_score = float(np.average(class_based_scores, weights=weights))
+    if recent_scores:
+        # 直近の重み勾配を緩やかに(1.0 〜 2.6)し、前走1走の着順だけで全てが決まらないように調整
+        weights = np.linspace(1.0, 2.6, len(recent_scores))
+        recent_weighted = float(np.average(recent_scores, weights=weights))
+        
+        # まぐれ防止: 最高1走ではなく「上位2走の平均」を実績ピーク値とする
+        sorted_scores = sorted(all_valid_scores, reverse=True)
+        if len(sorted_scores) >= 2:
+            top2_peak = float(np.mean(sorted_scores[:2]))
+        else:
+            top2_peak = sorted_scores[0]
+            
+        # 直近の勢い(75%) ＋ 実績ピーク上位2走平均(25%)
+        power_score = (recent_weighted * 0.75) + (top2_peak * 0.25)
     else:
         power_score = 0.50
 
-    return zenso_chakujun, avg_agari, shussou_kaisuu, power_score, makuri_flag
+    return raw_zenso, avg_agari, shussou_kaisuu, power_score, makuri_flag
 
 def get_course_rpci_stats(course_key):
     c_stats = course_history_db.get(course_key, {})
@@ -457,10 +513,17 @@ def fetch_hybrid_odds_and_result_weights(
     )
 
 
+# =====================================================================
+# 改良版: 馬体重増減による状態補正（-8kgでの過剰減点・完全消しを防止）
+# =====================================================================
 def infer_auto_condition_override(
     bamei: str, weight_val: float, change_val: float, weight_announced: bool,
     zenso: float, power_score: float, kaisuu: int
 ) -> tuple[str, str]:
+    """
+    馬体重増減はあくまで微調整（基本 0.94〜1.04倍）とし、
+    G1等の本番仕上げでよくある -6kg〜-8kg で能力指数が暴落しないようにする。
+    """
     if not weight_announced:
         return "1.00", "馬体重未発表（手動設定可）"
 
@@ -476,41 +539,47 @@ def infer_auto_condition_override(
             pass
     best_weight = float(np.mean(good_weights)) if good_weights else None
 
-    if change_val <= -8.0:
-        if weight_val <= 465.0 or change_val <= -10.0:
-            return "0.88", f"大幅馬体減({int(change_val)}kg)・輸送細化懸念"
-        elif zenso >= 6.0 and weight_val >= 485.0 and power_score >= 0.65:
-            return "1.04", f"大型馬の絞り込み({int(change_val)}kg)・太め解消"
-        else:
-            return "0.88", f"馬体減({int(change_val)}kg)・輸送細化判定"
+    # 1. 極端な大幅馬体減 (-14kg以下、または440kg未満の小柄な馬の-10kg以下) -> これだけ 0.88倍（完全消し対象）
+    if change_val <= -14.0 or (change_val <= -10.0 and weight_val < 440.0):
+        return "0.88", f"極端な馬体減({int(change_val)}kg)・深刻な輸送細化"
 
-    if -6.0 <= change_val <= -4.0:
-        if best_weight and abs(weight_val - best_weight) <= 2.0 and zenso >= 4.0:
-            return "1.04", "ベスト体重へ絞り込み・太め解消"
-        if weight_val <= 424.0:
-            return "0.90", f"小柄な馬の馬体減({int(change_val)}kg)"
-        return "1.00", "標準範囲内"
+    # 2. やや大きめの馬体減 (-10kg 〜 -12kg) -> 0.94倍（微〜中減点、完全消しにはしない）
+    if -12.0 <= change_val <= -10.0:
+        if weight_val >= 500.0 and power_score >= 0.65:
+            return "1.00", f"大型馬の絞り込み({int(change_val)}kg)・許容範囲"
+        return "0.94", f"馬体減({int(change_val)}kg)・やや細化注意"
 
+    # 3. 本番の絞り込みゾーン (-8kg 〜 -4kg) -> 大型馬は減点なし、中型馬でも 0.97倍〜1.00倍
+    if -8.0 <= change_val <= -4.0:
+        if best_weight and abs(weight_val - best_weight) <= 3.0:
+            return "1.03", f"ベスト体重へ引き締め({int(change_val)}kg)・好仕上がり"
+        if weight_val >= 480.0:
+            return "1.00", f"大型馬の引き締め({int(change_val)}kg)・標準範囲"
+        if change_val == -8.0 and weight_val < 460.0:
+            return "0.97", f"やや馬体減({int(change_val)}kg)・微減点のみ"
+        return "1.00", f"本番仕様の引き締め({int(change_val)}kg)・標準"
+
+    # 4. 増減ほぼなし (-2kg 〜 +2kg)
     if -2.0 <= change_val <= 2.0:
-        if power_score >= 0.68 and zenso <= 3.0 and kaisuu >= 2:
-            return "1.05", f"好調維持({change_val:+.0f}kg)・究極仕上げ"
+        if power_score >= 0.72 and zenso <= 3.0 and kaisuu >= 2:
+            return "1.04", f"好調維持({change_val:+.0f}kg)・好仕上がり"
         return "1.00", "馬体安定（標準）"
 
+    # 5. 小〜中幅プラス (+4kg 〜 +10kg)
     if 4.0 <= change_val <= 10.0:
         if best_weight and abs(weight_val - best_weight) <= 3.0:
-            return "1.04", f"ベスト体重合致({change_val:+.0f}kg)・太め解消/充実"
-        if 6.0 <= change_val <= 8.0 and 485.0 <= weight_val <= 506.0 and power_score >= 0.58:
-            return "1.04", f"馬体充実({change_val:+.0f}kg)・太め解消判定"
-        if zenso <= 4.0 or power_score >= 0.62:
+            return "1.03", f"ベスト体重合致({change_val:+.0f}kg)・充実"
+        if zenso <= 4.0 or power_score >= 0.65:
             return "1.03", f"好走圏内の馬体増({change_val:+.0f}kg)・成長分"
         if change_val >= 8.0 and zenso >= 8.0 and power_score < 0.52:
-            return "0.92", f"凡走後の馬体増({change_val:+.0f}kg)・太め残り懸念"
+            return "0.95", f"凡走後の馬体増({change_val:+.0f}kg)・やや太め注意"
         return "1.00", "標準範囲内"
 
+    # 6. 大幅プラス (+12kg以上)
     if change_val >= 12.0:
-        if power_score >= 0.66 and zenso <= 3.0:
-            return "1.03", f"実績馬の馬体増({change_val:+.0f}kg)・成長分"
-        return "0.92", f"大幅馬体増({change_val:+.0f}kg)・太め残り判定"
+        if power_score >= 0.68 and zenso <= 3.0:
+            return "1.02", f"実績馬の馬体増({change_val:+.0f}kg)・成長分"
+        return "0.94", f"大幅馬体増({change_val:+.0f}kg)・太め残り注意"
 
     return "1.00", "標準"
 
@@ -539,7 +608,7 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
     front_ratio = (nige_cnt + senkou_cnt) / float(total_h)
     avg_pci = float(np.mean([h.get("pci", 50.0) for h in horses_data]))
 
-    if nige_cnt >= 3 or (nige_cnt >= 2 and front_ratio >= 0.45) or (course_rpci < 48.0 and nige_cnt >= 2):
+    if nige_cnt >= 3 or (nige_cnt >= 2 and front_ratio >= 0.48) or (course_rpci < 48.0 and nige_cnt >= 2):
         pace = "H_MAEKUZURE"
         msg = f"✅ 展開自動判定: 逃げ{nige_cnt}頭・先行{senkou_cnt}頭（先行勢{int(front_ratio*100)}%）で先行激化 ➔ 『ハイ① 前崩れ消耗戦』を自動セット"
     elif (nige_cnt >= 2 and makuri_cnt >= 2) or (front_ratio >= 0.36 and avg_pci < 50.3) or (48.0 <= course_rpci < 49.8 and nige_cnt >= 1):
@@ -548,7 +617,7 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
     elif (nige_cnt == 0 and front_ratio <= 0.25 and avg_pci >= 51.8) or (nige_cnt <= 1 and course_rpci > 53.0 and makuri_cnt == 0):
         pace = "S_YOIDON"
         msg = f"✅ 展開自動判定: 逃げ{nige_cnt}頭・先行{senkou_cnt}頭と手薄＆平均PCI {avg_pci:.1f} ➔ 『スロー① 直線ヨーイドン』を自動セット"
-    elif nige_cnt <= 1 and front_ratio <= 0.32 and (makuri_cnt >= 1 or 51.5 <= course_rpci <= 53.2):
+    elif nige_cnt <= 1 and front_ratio <= 0.35 and (makuri_cnt >= 1 or 51.5 <= course_rpci <= 53.2):
         pace = "S_LONSPA"
         msg = f"✅ 展開自動判定: 逃げ{nige_cnt}頭で道中緩むがマクリ・持続力馬あり ➔ 『スロー② ロンスパ・マクリ戦』を自動セット"
     else:
@@ -559,12 +628,6 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
 
 
 def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> Optional[List[Dict[str, int]]]:
-    """
-    result.htmlが確定済みかどうか、またtarget_track_type(芝/ダ)と一致するかを判定。
-    ・未確定ページの場合: None を返す
-    ・確定済みだが別コース(例:芝狙いなのにダート)の場合: 空リスト [] を返す
-    ・確定済みかつ同コースの場合: 1〜3着の枠番と4角位置のリストを返す
-    """
     if "HorseList" not in res_html:
         return None
     if "Result_Num" not in res_html and "PassageRate" not in res_html and "All_Result_Table" not in res_html:
@@ -616,11 +679,6 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
 
 
 def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]:
-    """
-    <title>タグやActiveタブから、対象レース自身の開催年月日を抽出し、
-    正確な曜日（月=0 ... 金=4, 土=5, 日=6）を返す。
-    （ページ内の他日程タブの「(土)」文字列による誤判定を防止）
-    """
     title_m = re.search(r'<title>(.*?)</title>', shutuba_html, re.IGNORECASE | re.DOTALL)
     if title_m:
         t_str = title_m.group(1)
@@ -632,7 +690,6 @@ def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]
             except:
                 pass
 
-    # Activeな日付タブから曜日を判定
     act_m = re.search(r'<dd[^>]*class="[^"]*Active[^"]*"[^>]*>(.*?)</dd>', shutuba_html, re.IGNORECASE | re.DOTALL)
     if act_m:
         act_txt = act_m.group(1)
@@ -646,22 +703,13 @@ def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]
 
 
 def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: str) -> tuple[str, str, str, str]:
-    """
-    ・パターン1（当日8R頃に11Rを予想 / 土曜11Rを予想）:
-      当日の1Rが確定していれば、直前R(race_num-1)〜1Rをスキャンし、当日の確定済み同コース結果からバイアスを算出。
-    ・パターン2（土曜日に日曜11Rを予想 / 日曜朝イチに日曜のレースを予想）:
-      当日の確定レースがまだ無い（または1鞍以下）場合、前日（土曜日: day_num - 1）の12R〜1Rをすべてスキャンし、
-      土曜日の同コース結果からバイアスを算出。
-    ・パターン3（金曜に土曜を予想など、当日も前日も結果がない場合）:
-      エラーを出さず手動入力案内へ安全にフォールバック。
-    """
     try:
         if len(race_id) < 12 or not race_id.isdigit():
             return "フラット", "中", "manual_required", "⚠️ レースID形式から過去レースを参照できないため、トラックバイアスは手動で設定してください。"
 
-        prefix_8 = race_id[:8]          # YYYYPPKK
-        day_num = int(race_id[8:10])    # 日目 (01〜12)
-        race_num = int(race_id[10:12])  # R (01〜12)
+        prefix_8 = race_id[:8]
+        day_num = int(race_id[8:10])
+        race_num = int(race_id[10:12])
 
         weekday = detect_target_race_weekday(shutuba_html, day_num)
         is_saturday_race = (weekday == 5) or (day_num == 1)
@@ -671,9 +719,6 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
         sampled_same_day = 0
         sampled_prev_day = 0
 
-        # =========================================================
-        # STEP 1: 当日(day_num)の確定レースがあるかチェック（1Rで確認）
-        # =========================================================
         same_day_has_results = False
         if race_num >= 2:
             r1_id = f"{prefix_8}{day_num:02d}01"
@@ -685,7 +730,6 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
                     parsed_r1 = parse_single_race_result_for_bias(r1_res.text, target_track_type)
                     if parsed_r1 is not None:
                         same_day_has_results = True
-                        # 1Rが確定していれば、直前レース(race_num - 1)から2Rまで新しい順にスキャン
                         for r_no in range(race_num - 1, 1, -1):
                             if sampled_same_day >= 5:
                                 break
@@ -696,26 +740,19 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
                                 if r_res.status_code == 200:
                                     r_res.encoding = r_res.apparent_encoding
                                     parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
-                                    # 未確定レース(parsed is None)はスキップして確定済みレースを拾う
                                     if parsed:
                                         collected_top3.extend(parsed)
                                         sampled_same_day += 1
                             except:
                                 continue
-                        # 1R自体も同コースかつまだ5鞍未満なら追加
                         if parsed_r1 and sampled_same_day < 5:
                             collected_top3.extend(parsed_r1)
                             sampled_same_day += 1
             except:
                 pass
 
-        # =========================================================
-        # STEP 2: 当日の同コース確定レースが2鞍未満の場合 ➔ 前日(土曜日等: day_num - 1)の12R〜1Rを探索
-        # （土曜に日曜11Rを予想する時、または日曜午前中で当日芝レースがまだ少ない時）
-        # =========================================================
         if sampled_same_day < 2 and day_num >= 2 and not is_saturday_race:
             prev_day = day_num - 1
-            # まず前日のメイン付近(11Rまたは1R)が存在するか確認し、12Rから1Rまで同コースを最大5鞍収集
             for r_no in range(12, 0, -1):
                 if (sampled_same_day + sampled_prev_day) >= 5:
                     break
@@ -727,7 +764,6 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
                         r_res.encoding = r_res.apparent_encoding
                         parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
                         if parsed is None and r_no == 11 and sampled_prev_day == 0:
-                            # 前日の11Rすら未確定なら前日データもまだ存在しないと判断して打ち切り
                             break
                         if parsed:
                             collected_top3.extend(parsed)
@@ -748,9 +784,6 @@ def auto_detect_track_bias(race_id: str, target_track_type: str, shutuba_html: s
                 "⚠️ 参照できる当日・前日の同コース確定レース結果がまだありません。トラックバイアスは手動で設定してください。"
             )
 
-        # =========================================================
-        # STEP 3: 収集した1〜3着馬の枠番・通過順位からバイアスと強度を判定
-        # =========================================================
         total_horses = len(collected_top3)
         inner_cnt = sum(1 for x in collected_top3 if x["waku"] <= 4)
         outer_cnt = sum(1 for x in collected_top3 if x["waku"] >= 5)
@@ -1025,7 +1058,7 @@ def fetch_race(race_id: str):
 
         if any_weight_announced:
             weight_status = "auto_detected"
-            weight_msg = "✅ 当日馬体重の増減と過去好走実績から、全頭の『状態補正（太め解消・成長分・輸送細化等）』を自動セットしました。"
+            weight_msg = "✅ 当日馬体重の増減と過去好走実績から、全頭の『状態補正（本番引き締め・成長分・細化注意等）』をマイルド設定で自動セットしました。"
         else:
             weight_status = "manual_required"
             weight_msg = "⚠️ 当日馬体重が未発表のため『通常（補正なし）』にセットしました。発表後または手動で設定してください。"
@@ -1133,17 +1166,22 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
 
 
 def calculate_stage1_pure_score(raw_lgb_pred_neutral: float, horse: HorseData, power_score: float, time_diff_base: float) -> float:
+    """
+    【第1段階: 素の地力診断】
+    直近の勢い75%＋過去上位2走平均25%で算出された power_score の比重を 0.44 に高め、
+    条件戦の上がりタイムだけで実績馬が逆転されすぎないよう agari_factor の振れ幅をマイルド化(0.97〜1.03)。
+    """
     if horse.odds > 1.0:
         market_prob = min(0.55, 0.80 / float(horse.odds))
     else:
         market_prob = 0.08
 
     agari_factor = 1.0
-    if time_diff_base <= -0.3: agari_factor = 1.05
-    elif time_diff_base <= 0.0: agari_factor = 1.02
-    elif time_diff_base >= 0.6: agari_factor = 0.95
+    if time_diff_base <= -0.3: agari_factor = 1.03
+    elif time_diff_base <= 0.0: agari_factor = 1.01
+    elif time_diff_base >= 0.6: agari_factor = 0.97
 
-    pure_ability = ((raw_lgb_pred_neutral * 0.42) + (power_score * 0.38) + (market_prob * 0.20)) * agari_factor
+    pure_ability = ((raw_lgb_pred_neutral * 0.38) + (power_score * 0.44) + (market_prob * 0.18)) * agari_factor
     return float(pure_ability)
 
 
@@ -1157,67 +1195,68 @@ def calculate_comprehensive_score(
     else: market_prob = 0.08
 
     if expected_pace in ["M_JIRIKI", "M"]:
-        base_ability = (raw_lgb_pred * 0.45) + (power_score * 0.35) + (market_prob * 0.20)
+        base_ability = (raw_lgb_pred * 0.40) + (power_score * 0.40) + (market_prob * 0.20)
     else:
-        base_ability = (raw_lgb_pred * 0.50) + (power_score * 0.30) + (market_prob * 0.20)
+        base_ability = (raw_lgb_pred * 0.44) + (power_score * 0.36) + (market_prob * 0.20)
 
     kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
 
     pace_mult = 1.0
     if expected_pace in ["S_YOIDON", "S"]:
-        if h_pci_type == "C": pace_mult *= 1.12
+        if h_pci_type == "C": pace_mult *= 1.10
         elif h_pci_type == "B": pace_mult *= 1.00
-        else: pace_mult *= 0.90
+        else: pace_mult *= 0.93
         if kyaku == 1: pace_mult *= 1.06
         elif kyaku == 2: pace_mult *= 1.08
         elif kyaku == 3: pace_mult *= 1.04
-        elif kyaku == 4: pace_mult *= 0.88
-        if time_diff <= -0.3: pace_mult *= 1.08
-        elif time_diff <= 0.1: pace_mult *= 1.04
-        elif time_diff >= 0.6: pace_mult *= 0.93
+        elif kyaku == 4: pace_mult *= 0.90
+        if time_diff <= -0.3: pace_mult *= 1.06
+        elif time_diff <= 0.1: pace_mult *= 1.03
+        elif time_diff >= 0.6: pace_mult *= 0.95
 
     elif expected_pace == "S_LONSPA":
-        if 49.5 <= h_pci <= 54.0: pace_mult *= 1.10
+        if 49.5 <= h_pci <= 54.5: pace_mult *= 1.09
         elif h_pci_type == "C": pace_mult *= 1.04
-        else: pace_mult *= 0.94
+        else: pace_mult *= 0.95
         if kyaku == 1: pace_mult *= 0.96
-        elif kyaku == 2: pace_mult *= 1.07
+        elif kyaku == 2: pace_mult *= 1.06
         elif kyaku == 3: pace_mult *= 1.08
-        elif kyaku == 4: pace_mult *= 0.95
-        if makuri_flag: pace_mult *= 1.07
+        elif kyaku == 4: pace_mult *= 0.96
+        if makuri_flag: pace_mult *= 1.06
 
     elif expected_pace in ["M_JIRIKI", "M"]:
-        if h_pci_type == "B": pace_mult *= 1.08
-        else: pace_mult *= 0.98
+        if h_pci_type == "B": pace_mult *= 1.06
+        else: pace_mult *= 0.99
         if kyaku == 1: pace_mult *= 0.98
-        elif kyaku == 2: pace_mult *= 1.08
+        elif kyaku == 2: pace_mult *= 1.07
         elif kyaku == 3: pace_mult *= 1.04
-        elif kyaku == 4: pace_mult *= 0.92
-        if power_score >= 0.70: pace_mult *= 1.06
+        elif kyaku == 4: pace_mult *= 0.94
+        if power_score >= 0.72: pace_mult *= 1.05
 
     elif expected_pace == "M_LONSPA":
-        if 46.5 <= h_pci <= 50.8: pace_mult *= 1.10
+        if 46.5 <= h_pci <= 51.5: pace_mult *= 1.08
         elif h_pci_type == "A": pace_mult *= 1.04
-        else: pace_mult *= 0.92
-        if kyaku == 1: pace_mult *= 0.91
+        else: pace_mult *= 0.95
+        if kyaku == 1: pace_mult *= 0.92
         elif kyaku == 2: pace_mult *= 1.04
-        elif kyaku == 3: pace_mult *= 1.09
+        elif kyaku == 3: pace_mult *= 1.08
         elif kyaku == 4: pace_mult *= 1.02
         if makuri_flag: pace_mult *= 1.05
 
     elif expected_pace in ["H_MAEKUZURE", "H"]:
-        if h_pci_type == "A": pace_mult *= 1.14
-        elif h_pci_type == "B": pace_mult *= 1.00
-        else: pace_mult *= 0.88
-        if kyaku == 1: pace_mult *= 0.84
-        elif kyaku == 2: pace_mult *= 0.92
-        elif kyaku == 3: pace_mult *= 1.09
-        elif kyaku == 4: pace_mult *= 1.13
+        # 3歳重賞等で全員がPCI:Cの時に過剰減点にならないよう 0.88 -> 0.94 に緩和
+        if h_pci_type == "A": pace_mult *= 1.12
+        elif h_pci_type == "B": pace_mult *= 1.02
+        else: pace_mult *= 0.94
+        if kyaku == 1: pace_mult *= 0.86
+        elif kyaku == 2: pace_mult *= 0.94
+        elif kyaku == 3: pace_mult *= 1.08
+        elif kyaku == 4: pace_mult *= 1.11
 
     if course_rpci > 0 and h_pci > 0:
-        if abs(course_rpci - h_pci) >= 3.0:
-            pace_mult *= 0.92
+        if abs(course_rpci - h_pci) >= 4.0:
+            pace_mult *= 0.95
 
     bias_mult = 1.0
     boost = 1.08
@@ -1270,7 +1309,7 @@ def calculate_comprehensive_score(
         pass
 
     total_mult = pace_mult * bias_mult * time_limit_mult * condition_mult
-    capped_mult = max(0.75, min(1.25, total_mult))
+    capped_mult = max(0.78, min(1.22, total_mult))
 
     return base_ability * capped_mult, round(bias_mult, 3), round(pace_mult, 3), round(condition_mult, 3)
 
@@ -1316,6 +1355,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         u = h["umaban"]
         if u == axis_umaban or u in main_2nd_umabans:
             continue
+        # 極端な馬体減(-14kg以下等、0.88倍以下)のみ除外
         if h.get("condition_mult", 1.0) <= 0.88:
             continue
 
@@ -1361,7 +1401,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         elif c_mult <= 0.88:
             eliminated_umabans.add(u)
             h["role_code"] = "ELIMINATED"
-            h["role_label"] = "💀 完全消し (大幅馬体減)"
+            h["role_label"] = "💀 完全消し (極端な馬体減)"
 
     for h in horses_data:
         u = h["umaban"]
@@ -1502,6 +1542,9 @@ def diagnose_race(request: RaceRequest):
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
 
+        # 実績上位馬(power_score >= 0.78)が前走1回だけ大敗している場合、LightGBMの「前走着順」特徴量による過剰減点を防ぐため上限6.0着に緩和
+        effective_zenso_for_lgb = min(zenso, 6.0) if power_score >= 0.78 else zenso
+
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
         time_diff_base = course_up - base_req_up
@@ -1517,7 +1560,7 @@ def diagnose_race(request: RaceRequest):
             '枠番': 4.0, '馬番': 8.0, '斤量': horse.kinryou, '馬体重_数値': 480.0,
             'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
             'track_condition_enc': cond_enc, '舞台_平均前半ペース': base_pace_f, '舞台_平均後半ペース': base_pace_l,
-            '舞台_平均要求上がり': base_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': zenso,
+            '舞台_平均要求上がり': base_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': effective_zenso_for_lgb,
             '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
             '上がりタイム差分': time_diff_base, 'kishu_enc': kishu_enc
         }])
@@ -1528,7 +1571,7 @@ def diagnose_race(request: RaceRequest):
             '枠番': horse.wakuban, '馬番': horse.umaban, '斤量': horse.kinryou, '馬体重_数値': horse.bataijuu,
             'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
             'track_condition_enc': cond_enc, '舞台_平均前半ペース': avg_pace_f, '舞台_平均後半ペース': avg_pace_l,
-            '舞台_平均要求上がり': avg_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': zenso,
+            '舞台_平均要求上がり': avg_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': effective_zenso_for_lgb,
             '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
             '上がりタイム差分': time_diff, 'kishu_enc': kishu_enc
         }])
@@ -1664,6 +1707,7 @@ def simulate_race(request: RaceRequest):
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
+        effective_zenso_for_lgb = min(zenso, 6.0) if power_score >= 0.78 else zenso
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
@@ -1679,7 +1723,7 @@ def simulate_race(request: RaceRequest):
             '枠番': horse.wakuban, '馬番': horse.umaban, '斤量': horse.kinryou, '馬体重_数値': horse.bataijuu,
             'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
             'track_condition_enc': cond_enc, '舞台_平均前半ペース': avg_pace_f, '舞台_平均後半ペース': avg_pace_l,
-            '舞台_平均要求上がり': avg_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': zenso,
+            '舞台_平均要求上がり': avg_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': effective_zenso_for_lgb,
             '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
             '上がりタイム差分': time_diff, 'kishu_enc': kishu_enc
         }])
