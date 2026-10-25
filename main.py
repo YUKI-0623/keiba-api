@@ -14,7 +14,7 @@ import pickle
 import math
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: 地力ブレンド最適化/馬体重補正マイルド化/ハイブリッドオッズ)")
+app = FastAPI(title="競馬シミュレーションAPI (プロ仕様完全版: オッズ取得バグ完全修正/地力ブレンド/馬体重マイルド化)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -116,7 +116,6 @@ def infer_class_factor(record: dict) -> float:
     return 0.75
 
 def infer_margin_seconds(record: dict) -> float:
-    """DBにmarginが存在しない場合のフォールバック判定（マイナス着差は0.0に正規化）"""
     if 'margin' in record and record['margin'] is not None:
         try:
             val = float(record['margin'])
@@ -135,7 +134,6 @@ def infer_margin_seconds(record: dict) -> float:
         return 0.75
 
 def calc_jra_wakuban(umaban: int, total_horses: int) -> int:
-    """JRA公式ルールに基づく頭数別の正確な枠番算出フォールバック"""
     if total_horses <= 8:
         return max(1, min(8, umaban))
     double_frames = min(8, total_horses - 8)
@@ -190,13 +188,6 @@ def get_horse_pci_stats(bamei_str):
     return avg_pci, get_pci_label(avg_pci)
 
 def get_horse_real_stats(bamei_str):
-    """
-    【改良版地力算出】
-    ・直近5走の勢い（加重平均）: 75%
-    ・過去走の上位2走平均（Top-2 Peak Average）: 25%
-    1回だけのまぐれ（フロック）で実力のない馬が浮上するのを防ぎつつ、
-    ダービーや重賞で実績のある馬が前走の1敗だけで最下位付近に沈む現象を防ぐ。
-    """
     records = horse_history_db.get(bamei_str, {}).get('race_records', [])
     if not records: return 8.0, 35.0, 0, 0.5, False
     
@@ -218,7 +209,6 @@ def get_horse_real_stats(bamei_str):
     recent_scores = []
     all_valid_scores = []
     
-    # 過去最大7走までスキャンしてTop-2実績を把握、直近5走で勢いを算出
     scan_records = records[-7:]
     for idx, r in enumerate(scan_records):
         passing = str(r.get('passing', ''))
@@ -246,18 +236,15 @@ def get_horse_real_stats(bamei_str):
             recent_scores.append(run_score)
 
     if recent_scores:
-        # 直近の重み勾配を緩やかに(1.0 〜 2.6)し、前走1走の着順だけで全てが決まらないように調整
         weights = np.linspace(1.0, 2.6, len(recent_scores))
         recent_weighted = float(np.average(recent_scores, weights=weights))
         
-        # まぐれ防止: 最高1走ではなく「上位2走の平均」を実績ピーク値とする
         sorted_scores = sorted(all_valid_scores, reverse=True)
         if len(sorted_scores) >= 2:
             top2_peak = float(np.mean(sorted_scores[:2]))
         else:
             top2_peak = sorted_scores[0]
             
-        # 直近の勢い(75%) ＋ 実績ピーク上位2走平均(25%)
         power_score = (recent_weighted * 0.75) + (top2_peak * 0.25)
     else:
         power_score = 0.50
@@ -289,9 +276,18 @@ def adjust_pace_times(expected_pace, avg_pace_f, avg_pace_l, avg_req_up):
 
 
 # =====================================================================
-# 終了レース(HTML形式) ＆ 未来レース(JavaScript API形式) ハイブリッドオッズ取得
+# 完全修正版: 終了レース(HTML形式) ＆ 未来レース(JavaScript API形式) オッズ取得
+# （1列目のResult_Num[着順]や2列目のWaku[枠番]との混同バグを完全排除）
 # =====================================================================
-def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], Dict[int, tuple[float, float]]]:
+def parse_finished_race_html_odds(
+    result_html: str, bamei_to_umaban: Optional[Dict[str, int]] = None
+) -> tuple[Dict[int, float], Dict[int, tuple[float, float]]]:
+    """
+    【終了した過去レース用: HTML形式】
+    result.html の結果テーブル(<tr class="HorseList">)から「馬番」ごとの確定単勝オッズと馬体重を抽出する。
+    ※ 1列目(Result_Num=着順)、2列目(Waku=枠番)を誤って馬番にしないよう、
+       3列目(tds[2])および馬名照合(bamei_to_umaban)で厳密に馬番を特定する。
+    """
     odds_map: Dict[int, float] = {}
     weight_map: Dict[int, tuple[float, float]] = {}
 
@@ -304,21 +300,46 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
     rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', result_html, re.DOTALL | re.IGNORECASE)
     for row in rows:
         try:
+            tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if len(tds) < 8:
+                continue
+
             umaban = 0
-            u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban|Num\s+Txt_C|Num)[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
-            if u_m:
-                u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
-                if u_str.isdigit():
-                    umaban = int(u_str)
+
+            # 方法1: 馬名から出馬表の馬番辞書(bamei_to_umaban)と照合（最も確実・100%ズレない）
+            if bamei_to_umaban:
+                b_m = re.search(r'<span[^>]*class="[^"]*Horse_Name[^"]*"[^>]*>(.*?)</span>', row, re.IGNORECASE | re.DOTALL)
+                if not b_m:
+                    b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', row, re.IGNORECASE | re.DOTALL)
+                if b_m:
+                    b_clean = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
+                    if b_clean in bamei_to_umaban:
+                        umaban = bamei_to_umaban[b_clean]
+
+            # 方法2: result.htmlの列構造では [0]=着順(Result_Num), [1]=枠番(Waku), [2]=馬番(Num Txt_C)
+            if umaban == 0 and len(tds) >= 3:
+                cand_umaban = re.sub(r'<[^>]*>', '', tds[2]).strip()
+                if cand_umaban.isdigit():
+                    u_val = int(cand_umaban)
+                    if 1 <= u_val <= 18:
+                        umaban = u_val
+
+            # 方法3: クラス名が "Num Txt_C" (Result_NumやWakuを含まない) のtdから取得
             if umaban == 0:
-                tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
-                if len(tds) >= 3:
-                    cand = re.sub(r'<[^>]*>', '', tds[2]).strip()
-                    if cand.isdigit():
-                        umaban = int(cand)
+                u_m = re.search(
+                    r'<td[^>]*class="\s*(?:Num\s+Txt_C|Txt_C\s+Num|Umaban)\s*"[^>]*>(.*?)</td>',
+                    row, re.IGNORECASE | re.DOTALL
+                )
+                if u_m:
+                    u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
+                    if u_str.isdigit():
+                        umaban = int(u_str)
+
             if umaban == 0:
                 continue
 
+            # 単勝オッズの抽出:
+            # result.htmlでは <td class="Odds Txt_R"> に単勝オッズ（小数点付き）、<td class="Odds BgYellow">等に人気（整数）が入る
             odds_val = None
             o_m = re.search(r'<td[^>]*class="[^"]*Odds\s+Txt_R[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if o_m:
@@ -328,17 +349,18 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
                     odds_val = float(m_fl.group(1))
 
             if odds_val is None:
+                # クラスにOddsを含むセルのうち、小数点（\d+\.\d+）を持つセルだけを抽出（整数の「人気」を除外）
                 odds_cells = re.findall(r'<td[^>]*class="[^"]*Odds[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
                 for cell in odds_cells:
                     c_txt = re.sub(r'<[^>]*>', '', cell).strip().replace(',', '')
-                    m_fl = re.search(r'(\d+\.\d+)', c_txt)
+                    m_fl = re.search(r'^(\d+\.\d+)$', c_txt)
                     if m_fl:
                         odds_val = float(m_fl.group(1))
                         break
 
-            if odds_val is None:
-                tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
-                for idx_td in [10, 9, 11, 8]:
+            if odds_val is None and len(tds) >= 11:
+                # フォールバック: 11列目(tds[10])が単勝オッズ列（12列目tds[11]は後3Fなので除外）
+                for idx_td in [10, 9]:
                     if idx_td < len(tds):
                         c_txt = re.sub(r'<[^>]*>', '', tds[idx_td]).strip().replace(',', '')
                         if re.match(r'^\d+\.\d+$', c_txt):
@@ -350,6 +372,7 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
             if odds_val is not None and odds_val >= 1.0:
                 odds_map[umaban] = odds_val
 
+            # 確定馬体重の抽出
             w_m = re.search(r'<td[^>]*class="[^"]*Weight[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
             if w_m:
                 w_str = re.sub(r'<[^>]*>', '', w_m.group(1)).strip()
@@ -363,17 +386,23 @@ def parse_finished_race_html_odds(result_html: str) -> tuple[Dict[int, float], D
 
 
 def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, float], str]:
+    """
+    【未来のレース・馬券購入可能後のレース用: JavaScript動的API形式 ＋ スマホ版オッズページ補完】
+    1. api_get_jra_odds.html (action=init / update) から馬番キー("01"〜"18" または "1"〜"18")の単勝オッズを取得
+    2. 万が一APIが空の場合は race.sp.netkeiba.com/?pid=odds_view&type=b1 から取得
+    """
     odds_map: Dict[int, float] = {}
     js_headers = {
-        'User-Agent': headers.get('User-Agent', 'Mozilla/5.0'),
+        'User-Agent': headers.get('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'),
         'Referer': f'https://race.netkeiba.com/race/shutuba.html?race_id={race_id}',
-        'X-Requested-With': 'XMLHttpRequest'
+        'X-Requested-With': 'XMLHttpRequest',
+        'Accept': 'application/json, text/javascript, */*; q=0.01'
     }
 
     api_urls = [
+        f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=init&sort=odds&compress=0&output=json",
         f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=update&compress=0&output=json",
-        f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=init&compress=0&output=json",
-        f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&compress=0"
+        f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&compress=0&output=json"
     ]
 
     api_status_str = ""
@@ -408,51 +437,81 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
                     o_str = str(raw_o).strip().replace(',', '')
                     if o_str and o_str not in ['---.-', '--.-', '-', '']:
                         o_val = float(o_str)
-                        if o_val >= 1.0:
+                        if 1.0 <= o_val <= 9999.9:
                             temp_map[u_num] = o_val
                 except:
                     continue
 
-            if temp_map:
+            if len(temp_map) >= 2:
                 odds_map = temp_map
                 api_status_str = status_val
                 break
         except:
             continue
 
-    if odds_map:
+    if len(odds_map) >= 2:
         if api_status_str == "yoso":
             return odds_map, "js_yoso"
         return odds_map, "js_realtime"
+
+    # バックアップ: スマホ版単勝オッズ一覧ページから馬番とオッズを取得
+    try:
+        time.sleep(0.2)
+        sp_url = f"https://race.sp.netkeiba.com/?pid=odds_view&type=b1&race_id={race_id}"
+        sp_res = requests.get(sp_url, headers=headers, timeout=6)
+        if sp_res.status_code == 200:
+            sp_res.encoding = sp_res.apparent_encoding
+            sp_map: Dict[int, float] = {}
+            tr_blocks = re.findall(r'<tr[^>]*>(.*?)</tr>', sp_res.text, re.DOTALL | re.IGNORECASE)
+            for tr in tr_blocks:
+                tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.DOTALL | re.IGNORECASE)
+                if len(tds) >= 4:
+                    u_cand = re.sub(r'<[^>]*>', '', tds[1]).strip()
+                    o_cand = re.sub(r'<[^>]*>', '', tds[-1]).strip().replace(',', '')
+                    if u_cand.isdigit() and re.match(r'^\d+\.\d+$', o_cand):
+                        u_i = int(u_cand)
+                        o_f = float(o_cand)
+                        if 1 <= u_i <= 18 and 1.0 <= o_f <= 9999.9:
+                            sp_map[u_i] = o_f
+            if len(sp_map) >= 2:
+                return sp_map, "js_realtime"
+    except:
+        pass
 
     return {}, "none"
 
 
 def fetch_hybrid_odds_and_result_weights(
-    race_id: str, shutuba_html: str, headers: dict
+    race_id: str, shutuba_html: str, headers: dict, bamei_to_umaban: Optional[Dict[str, int]] = None
 ) -> tuple[Dict[int, float], Dict[int, tuple[float, float]], str, str]:
+    """
+    1. 終了した過去レースなら result.html (HTML形式) から確定単勝オッズを取得（馬名・3列目馬番で厳密照合）
+    2. 未来/当日発走前のレースなら JavaScript動的API (api_get_jra_odds.html) からリアルタイム単勝オッズを取得
+    """
+    # 1. まずレース結果ページ(result.html)を確認し、終了レースならHTML形式で取得
     try:
-        time.sleep(0.25)
+        time.sleep(0.2)
         res_result = requests.get(
             f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
             headers=headers, timeout=8
         )
         if res_result.status_code == 200:
             res_result.encoding = res_result.apparent_encoding
-            html_odds, html_weights = parse_finished_race_html_odds(res_result.text)
+            html_odds, html_weights = parse_finished_race_html_odds(res_result.text, bamei_to_umaban)
             if len(html_odds) >= 2:
                 return (
                     html_odds,
                     html_weights,
                     "html_result",
-                    f"✅ オッズ自動取得 [過去レース・HTML形式]: レース結果HTMLから確定単勝オッズ（{len(html_odds)}頭）を自動反映しました。"
+                    f"✅ オッズ自動取得 [終了レース・HTML形式]: レース結果HTMLから確定単勝オッズ（{len(html_odds)}頭）を正確に反映しました。"
                 )
     except:
         pass
 
+    # 予備: 古い過去レース等で db.netkeiba.com 側に結果HTMLがある場合
     try:
         if len(race_id) == 12 and int(race_id[:4]) < datetime.now().year:
-            time.sleep(0.25)
+            time.sleep(0.2)
             res_db = requests.get(f"https://db.netkeiba.com/race/{race_id}/", headers=headers, timeout=8)
             if res_db.status_code == 200:
                 res_db.encoding = res_db.apparent_encoding
@@ -470,11 +529,12 @@ def fetch_hybrid_odds_and_result_weights(
                         db_odds,
                         {},
                         "html_db",
-                        f"✅ オッズ自動取得 [過去DB・HTML形式]: 過去データベースHTMLから確定単勝オッズ（{len(db_odds)}頭）を自動反映しました。"
+                        f"✅ オッズ自動取得 [過去DB・HTML形式]: 過去データベースHTMLから確定単勝オッズ（{len(db_odds)}頭）を反映しました。"
                     )
     except:
         pass
 
+    # 2. 終了レースではない場合 ➔ 未来/当日発走前レースとしてJavaScript動的API形式で取得
     js_odds, js_mode = fetch_future_race_js_odds(race_id, headers)
     if len(js_odds) >= 2:
         if js_mode == "js_yoso":
@@ -482,17 +542,18 @@ def fetch_hybrid_odds_and_result_weights(
                 js_odds,
                 {},
                 "js_yoso",
-                f"ℹ️ オッズ自動取得 [未来レース・JS形式(予想オッズ)]: 馬券発売前のためJavaScript APIから予想オッズ（{len(js_odds)}頭）を自動反映しました。"
+                f"ℹ️ オッズ自動取得 [未来レース・JS形式(予想オッズ)]: 馬券発売前のためJavaScript APIから予想オッズ（{len(js_odds)}頭）を反映しました。"
             )
         return (
             js_odds,
             {},
             "js_realtime",
-            f"✅ オッズ自動取得 [未来/当日レース・JS形式]: JavaScript動的APIから最新単勝オッズ（{len(js_odds)}頭）を自動反映しました。"
+            f"✅ オッズ自動取得 [未来/当日レース・JS形式]: JavaScript動的APIから最新単勝オッズ（{len(js_odds)}頭）を反映しました。"
         )
 
+    # 3. フォールバック: shutuba.html 内に直接埋め込まれているオッズがあれば抽出
     inline_odds: Dict[int, float] = {}
-    for m_in in re.finditer(r'id="odds-1_(\d+)"[^>]*>\s*(\d+\.\d+)\s*<', shutuba_html):
+    for m_in in re.finditer(r'id="odds-1_0*(\d+)"[^>]*>\s*(\d+\.\d+)\s*<', shutuba_html):
         try:
             inline_odds[int(m_in.group(1))] = float(m_in.group(2))
         except:
@@ -502,7 +563,7 @@ def fetch_hybrid_odds_and_result_weights(
             inline_odds,
             {},
             "html_inline",
-            f"✅ オッズ自動取得 [出馬表HTML]: 出馬表ページから単勝オッズ（{len(inline_odds)}頭）を自動反映しました。"
+            f"✅ オッズ自動取得 [出馬表HTML]: 出馬表ページから単勝オッズ（{len(inline_odds)}頭）を反映しました。"
         )
 
     return (
@@ -513,17 +574,10 @@ def fetch_hybrid_odds_and_result_weights(
     )
 
 
-# =====================================================================
-# 改良版: 馬体重増減による状態補正（-8kgでの過剰減点・完全消しを防止）
-# =====================================================================
 def infer_auto_condition_override(
     bamei: str, weight_val: float, change_val: float, weight_announced: bool,
     zenso: float, power_score: float, kaisuu: int
 ) -> tuple[str, str]:
-    """
-    馬体重増減はあくまで微調整（基本 0.94〜1.04倍）とし、
-    G1等の本番仕上げでよくある -6kg〜-8kg で能力指数が暴落しないようにする。
-    """
     if not weight_announced:
         return "1.00", "馬体重未発表（手動設定可）"
 
@@ -539,17 +593,14 @@ def infer_auto_condition_override(
             pass
     best_weight = float(np.mean(good_weights)) if good_weights else None
 
-    # 1. 極端な大幅馬体減 (-14kg以下、または440kg未満の小柄な馬の-10kg以下) -> これだけ 0.88倍（完全消し対象）
     if change_val <= -14.0 or (change_val <= -10.0 and weight_val < 440.0):
         return "0.88", f"極端な馬体減({int(change_val)}kg)・深刻な輸送細化"
 
-    # 2. やや大きめの馬体減 (-10kg 〜 -12kg) -> 0.94倍（微〜中減点、完全消しにはしない）
     if -12.0 <= change_val <= -10.0:
         if weight_val >= 500.0 and power_score >= 0.65:
             return "1.00", f"大型馬の絞り込み({int(change_val)}kg)・許容範囲"
         return "0.94", f"馬体減({int(change_val)}kg)・やや細化注意"
 
-    # 3. 本番の絞り込みゾーン (-8kg 〜 -4kg) -> 大型馬は減点なし、中型馬でも 0.97倍〜1.00倍
     if -8.0 <= change_val <= -4.0:
         if best_weight and abs(weight_val - best_weight) <= 3.0:
             return "1.03", f"ベスト体重へ引き締め({int(change_val)}kg)・好仕上がり"
@@ -559,13 +610,11 @@ def infer_auto_condition_override(
             return "0.97", f"やや馬体減({int(change_val)}kg)・微減点のみ"
         return "1.00", f"本番仕様の引き締め({int(change_val)}kg)・標準"
 
-    # 4. 増減ほぼなし (-2kg 〜 +2kg)
     if -2.0 <= change_val <= 2.0:
         if power_score >= 0.72 and zenso <= 3.0 and kaisuu >= 2:
             return "1.04", f"好調維持({change_val:+.0f}kg)・好仕上がり"
         return "1.00", "馬体安定（標準）"
 
-    # 5. 小〜中幅プラス (+4kg 〜 +10kg)
     if 4.0 <= change_val <= 10.0:
         if best_weight and abs(weight_val - best_weight) <= 3.0:
             return "1.03", f"ベスト体重合致({change_val:+.0f}kg)・充実"
@@ -575,7 +624,6 @@ def infer_auto_condition_override(
             return "0.95", f"凡走後の馬体増({change_val:+.0f}kg)・やや太め注意"
         return "1.00", "標準範囲内"
 
-    # 6. 大幅プラス (+12kg以上)
     if change_val >= 12.0:
         if power_score >= 0.68 and zenso <= 3.0:
             return "1.02", f"実績馬の馬体増({change_val:+.0f}kg)・成長分"
@@ -653,11 +701,9 @@ def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> 
             w_s = re.sub(r'<[^>]*>', '', w_m.group(1)).strip()
             if w_s.isdigit(): waku = int(w_s)
         if waku == 0:
-            u_m = re.search(r'<td[^>]*class="[^"]*Umaban[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
-            if not u_m:
-                u_m = re.search(r'<td[^>]*class="[^"]*Num Txt_C[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
-            if u_m:
-                u_s = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
+            tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+            if len(tds) >= 3:
+                u_s = re.sub(r'<[^>]*>', '', tds[2]).strip()
                 if u_s.isdigit(): waku = calc_jra_wakuban(int(u_s), total_h)
 
         last_corner = 0
@@ -923,12 +969,33 @@ def fetch_race(race_id: str):
             elif c_val == "不良": c_val = "不"
             track_condition = c_val
 
+        horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
+
+        # まず出馬表から「馬名 -> 馬番」の正確な辞書を作成（result.htmlでの着順誤認を100%防ぐため）
+        bamei_to_umaban: Dict[str, int] = {}
+        for block in horse_blocks:
+            try:
+                u_num = 0
+                u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
+                if u_m:
+                    u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
+                    if u_str.isdigit(): u_num = int(u_str)
+                if u_num == 0: continue
+                b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
+                if not b_m: b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
+                if b_m:
+                    b_str = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
+                    if b_str:
+                        bamei_to_umaban[b_str] = u_num
+            except:
+                continue
+
+        # ★ 終了レース(HTML形式) ＆ 未来レース(JavaScript動的API形式) のハイブリッドオッズ取得
         hybrid_odds_map, result_weight_map, odds_status, odds_msg = fetch_hybrid_odds_and_result_weights(
-            race_id, html, headers
+            race_id, html, headers, bamei_to_umaban
         )
 
         horses_data = []
-        horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
         
         def get_auto_kyakushitsu(bamei_str):
             try:
@@ -1166,11 +1233,6 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
 
 
 def calculate_stage1_pure_score(raw_lgb_pred_neutral: float, horse: HorseData, power_score: float, time_diff_base: float) -> float:
-    """
-    【第1段階: 素の地力診断】
-    直近の勢い75%＋過去上位2走平均25%で算出された power_score の比重を 0.44 に高め、
-    条件戦の上がりタイムだけで実績馬が逆転されすぎないよう agari_factor の振れ幅をマイルド化(0.97〜1.03)。
-    """
     if horse.odds > 1.0:
         market_prob = min(0.55, 0.80 / float(horse.odds))
     else:
@@ -1245,7 +1307,6 @@ def calculate_comprehensive_score(
         if makuri_flag: pace_mult *= 1.05
 
     elif expected_pace in ["H_MAEKUZURE", "H"]:
-        # 3歳重賞等で全員がPCI:Cの時に過剰減点にならないよう 0.88 -> 0.94 に緩和
         if h_pci_type == "A": pace_mult *= 1.12
         elif h_pci_type == "B": pace_mult *= 1.02
         else: pace_mult *= 0.94
@@ -1355,7 +1416,6 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         u = h["umaban"]
         if u == axis_umaban or u in main_2nd_umabans:
             continue
-        # 極端な馬体減(-14kg以下等、0.88倍以下)のみ除外
         if h.get("condition_mult", 1.0) <= 0.88:
             continue
 
@@ -1542,7 +1602,6 @@ def diagnose_race(request: RaceRequest):
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
 
-        # 実績上位馬(power_score >= 0.78)が前走1回だけ大敗している場合、LightGBMの「前走着順」特徴量による過剰減点を防ぐため上限6.0着に緩和
         effective_zenso_for_lgb = min(zenso, 6.0) if power_score >= 0.78 else zenso
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
