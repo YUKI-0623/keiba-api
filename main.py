@@ -15,7 +15,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (アプローチ①〜⑤完全実装版: 90%精度モデル)")
+app = FastAPI(title="競馬シミュレーションAPI (高速馬場上がり補正＆地力上位外枠保護・対抗穴攻め対応版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,13 +36,9 @@ with open('horse_history_db.pkl', 'rb') as f:
 with open('course_history_db.pkl', 'rb') as f:
     course_history_db = pickle.load(f)
 
-# リアルタイム5走柱で補強されたレコードと血統情報を保持するインメモリキャッシュ
 runtime_enriched_db: Dict[str, List[Dict[str, Any]]] = {}
 runtime_pedigree_db: Dict[str, Dict[str, str]] = {}
 
-# =====================================================================
-# アプローチ③: 主要種牡馬（父・母父）適性プロファイル辞書
-# =====================================================================
 SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "キタサンブラック": {"stamina": 3.0, "heavy": 2.5, "lonspa": 2.0},
     "エピファネイア": {"stamina": 3.0, "heavy": 2.0, "lonspa": 2.0},
@@ -128,10 +124,10 @@ KNOWN_HORSE_PEDIGREE: Dict[str, Dict[str, str]] = {
 }
 
 TRAINING_RANK_MULTIPLIERS: Dict[str, float] = {
-    "S": 1.05,  # 抜群・自己ベスト級・併せ馬圧倒
-    "A": 1.03,  # 好調・動き素軽い・上積み大
-    "B": 1.00,  # 標準・平行線（デフォルト）
-    "C": 0.92,  # 割引・併せ馬遅れ・終い減速・重め残り
+    "S": 1.05,
+    "A": 1.03,
+    "B": 1.00,
+    "C": 0.92,
 }
 
 def safe_encode(encoder_name, value):
@@ -1478,7 +1474,7 @@ class RaceRequest(BaseModel):
     expected_pace: str = "M_JIRIKI"
     track_bias: str = "フラット"
     bias_strength: str = "中" 
-    cushion_value: float = 9.0 
+    cushion_value: float = 9.5 
 
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
@@ -1659,7 +1655,7 @@ def fetch_race(race_id: str):
                 )
 
                 _, _, ped_summary = evaluate_pedigree_and_distance_aptitude(
-                    bamei, track_type, distance, track_condition, 9.0
+                    bamei, track_type, distance, track_condition, 9.5
                 )
 
                 rot_mult, rot_label = evaluate_rotation_aptitude(
@@ -1825,9 +1821,9 @@ def calculate_stage1_pure_score(
         market_prob = 0.08
 
     agari_factor = 1.0
-    if time_diff_base <= -0.3: agari_factor = 1.03
-    elif time_diff_base <= 0.0: agari_factor = 1.01
-    elif time_diff_base >= 0.6: agari_factor = 0.97
+    if time_diff_base <= -0.3: agari_factor = 1.035
+    elif time_diff_base <= 0.0: agari_factor = 1.015
+    elif time_diff_base >= 0.6: agari_factor = 0.965
 
     pure_ability = ((raw_lgb_pred_neutral * 0.36) + (power_score * 0.46) + (market_prob * 0.18)) * agari_factor * stage1_ped_mult
     return float(pure_ability)
@@ -1836,7 +1832,9 @@ def calculate_stage1_pure_score(
 def calculate_comprehensive_score(
     raw_lgb_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
     expected_pace, track_bias, bias_strength, cushion_value, course_rpci, 
-    time_limit_mult, stage2_ped_mult: float = 1.0, rotation_mult: float = 1.0, training_mult: float = 1.0
+    time_limit_mult, stage2_ped_mult: float = 1.0, rotation_mult: float = 1.0,
+    training_mult: float = 1.0, stage1_rank: int = 99, total_horses: int = 16,
+    track_condition: str = "良"
 ):
     if horse.odds > 1.0:
         market_prob = min(0.55, 0.80 / float(horse.odds))
@@ -1849,6 +1847,8 @@ def calculate_comprehensive_score(
 
     kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
+    is_fast_cushion = (cushion_value >= 9.5 and track_condition == "良")
+    is_elite_jiriki = (stage1_rank <= 3) or (power_score >= 0.78)
 
     pace_mult = 1.0
     if expected_pace in ["S_YOIDON", "S"]:
@@ -1872,15 +1872,27 @@ def calculate_comprehensive_score(
         elif kyaku == 3: pace_mult *= 1.08
         elif kyaku == 4: pace_mult *= 0.96
         if makuri_flag: pace_mult *= 1.06
+        if is_fast_cushion:
+            if time_diff <= -0.25: pace_mult *= 1.045
+            elif time_diff >= 0.45: pace_mult *= 0.96
 
     elif expected_pace in ["M_JIRIKI", "M"]:
-        if h_pci_type == "B": pace_mult *= 1.06
+        if h_pci_type == "B": pace_mult *= 1.05
+        elif h_pci_type == "C" and is_fast_cushion: pace_mult *= 1.04
         else: pace_mult *= 0.99
-        if kyaku == 1: pace_mult *= 0.98
-        elif kyaku == 2: pace_mult *= 1.07
-        elif kyaku == 3: pace_mult *= 1.04
-        elif kyaku == 4: pace_mult *= 0.94
+
+        if kyaku == 1: pace_mult *= 0.97
+        elif kyaku == 2: pace_mult *= 1.06
+        elif kyaku == 3: pace_mult *= 1.06 if is_fast_cushion else 1.04
+        elif kyaku == 4: pace_mult *= 0.98 if (is_fast_cushion and is_elite_jiriki) else 0.94
+
         if power_score >= 0.72: pace_mult *= 1.05
+
+        # ★改善1: クッション値9.5以上の高速馬場ではミドル①でも「極限の上がり差分(time_diff)」を加点・減点
+        if is_fast_cushion:
+            if time_diff <= -0.30: pace_mult *= 1.055
+            elif time_diff <= -0.05: pace_mult *= 1.025
+            elif time_diff >= 0.35: pace_mult *= 0.950
 
     elif expected_pace == "M_LONSPA":
         if 46.5 <= h_pci <= 51.5: pace_mult *= 1.08
@@ -1891,6 +1903,9 @@ def calculate_comprehensive_score(
         elif kyaku == 3: pace_mult *= 1.08
         elif kyaku == 4: pace_mult *= 1.02
         if makuri_flag: pace_mult *= 1.05
+        if is_fast_cushion:
+            if time_diff <= -0.25: pace_mult *= 1.04
+            elif time_diff >= 0.45: pace_mult *= 0.96
 
     elif expected_pace in ["H_MAEKUZURE", "H"]:
         if h_pci_type == "A": pace_mult *= 1.12
@@ -1949,6 +1964,12 @@ def calculate_comprehensive_score(
         elif waku == 5: bias_mult = half_boost
         elif waku <= 3: bias_mult = nerf
 
+    # ★改善2: Stage 1（素の地力）TOP3の実力馬に対する外枠・バイアス減点の大幅緩和 ＆ 多頭数包まれ回避補正
+    if is_elite_jiriki and bias_mult < 1.0:
+        bias_mult = 1.0 - (1.0 - bias_mult) * 0.42
+        if total_horses >= 15 and is_fast_cushion and waku >= 6 and kyaku >= 3 and time_diff <= 0.05:
+            bias_mult = max(bias_mult, 0.985)
+
     condition_mult = 1.00
     try:
         condition_mult = float(horse.condition_override)
@@ -1962,9 +1983,6 @@ def calculate_comprehensive_score(
     return base_ability * capped_mult, round(bias_mult, 3), round(pace_mult, 3), round(combined_cond_mult, 3)
 
 
-# =====================================================================
-# アプローチ⑤: 軸信頼度判定（危険な人気馬警報）＆ 軸飛び防御BOX・頭逆転フォーメーション自動生成
-# =====================================================================
 def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not horses_data:
         return {}
@@ -2033,7 +2051,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         u = h["umaban"]
         if u == axis_umaban or u in main_2nd_umabans:
             continue
-        if h not in saver_3rd_horses and h["shisu"] >= 54.0 and h.get("time_limit_mult", 1.0) >= 0.95 and len(saver_3rd_horses) < 4:
+        if h not in saver_3rd_horses and (h["shisu"] >= 53.5 or h["myoumi"] >= 58.5) and h.get("time_limit_mult", 1.0) >= 0.95 and len(saver_3rd_horses) < 5:
             h["rescue_type"] = "stage2_next"
             saver_3rd_horses.append(h)
 
@@ -2079,59 +2097,11 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
                 h["role_label"] = f"🛡️ 地力上位・バイアス救済 (地力{h['stage1_rank']}位)"
             else:
                 h["role_code"] = "SAVER_3RD"
-                h["role_label"] = "🛡️ 3列目押さえ (展開・能力圏内)"
+                h["role_label"] = "🛡️ 3列目押さえ (妙味・展開圏内)"
         elif u not in eliminated_umabans:
             h["role_code"] = "OTHER"
             h["role_label"] = "静観 (指数下位)"
 
-    # =========================================================
-    # ★アプローチ⑤-1: 軸信頼度（Axis Confidence）＆ 危険な人気馬の自動診断
-    # =========================================================
-    second_horse = by_stage2[1] if len(by_stage2) >= 2 else axis_horse
-    shisu_gap = round(float(axis_horse["shisu"] - second_horse["shisu"]), 1)
-
-    valid_odds_horses = [h for h in horses_data if h["odds"] >= 1.0]
-    fav_horse = min(valid_odds_horses, key=lambda x: x["odds"]) if valid_odds_horses else axis_horse
-
-    dangerous_fav_info = None
-    if fav_horse["odds"] <= 3.5 and (fav_horse["stage2_rank"] >= 3 or fav_horse["stage1_rank"] >= 4 or fav_horse.get("training_rank") == "C"):
-        dangerous_fav_info = {
-            "umaban": fav_horse["umaban"],
-            "bamei": fav_horse["bamei"],
-            "odds": fav_horse["odds"],
-            "stage1_rank": fav_horse["stage1_rank"],
-            "stage2_rank": fav_horse["stage2_rank"],
-            "reason": f"単勝{fav_horse['odds']}倍の1番人気ですが、素の地力{fav_horse['stage1_rank']}位・最終指数{fav_horse['stage2_rank']}位と過大評価の危険があります。1着固定は避け、タテ目BOXや逆転馬券を強く推奨します。"
-        }
-
-    if dangerous_fav_info is not None:
-        conf_level = "C_CHAOS"
-        conf_badge = "⚡ 波乱・タテ目警戒 (1番人気過信禁物)"
-        conf_advice = f"⚠️ 1番人気（{fav_horse['umaban']}番{fav_horse['bamei']}）とAI指数上位に乖離があります！頭固定の決め打ちは危険なため、下の『⑧ 軸飛び・タテ目防御 3連複5頭BOX』と『⑨ 頭逆転フォーメーション』を必ず併用してください。"
-    elif axis_horse["stage1_rank"] == 1 and shisu_gap >= 4.0:
-        conf_level = "S_SOLID"
-        conf_badge = f"👑 鉄板1強モード (2位と指数差 +{shisu_gap}pt)"
-        conf_advice = f"✅ 1着軸（{axis_umaban}番{axis_horse['bamei']}）は素の地力・最終指数ともに1位で、2位に{shisu_gap}ptの大差をつけています。⑥ 3連単1着固定フォーメーションが最も資金効率の高い勝負馬券です。"
-    elif shisu_gap >= 2.0 and axis_horse["stage1_rank"] <= 2:
-        conf_level = "A_STANDARD"
-        conf_badge = f"⚖️ 標準軸モード (2位と指数差 +{shisu_gap}pt)"
-        conf_advice = f"✅ 1着軸（{axis_umaban}番{axis_horse['bamei']}）は安定感がありますが、2列目（{second_horse['umaban']}番{second_horse['bamei']}など）の逆転や軸3着付けもケアすると取りこぼしが防げます。"
-    else:
-        conf_level = "B_RIVAL"
-        conf_badge = f"🔥 上位拮抗・二強〜三強モード (1・2位差 わずか{shisu_gap}pt)"
-        conf_advice = f"💡 最終1位（{axis_umaban}番{axis_horse['bamei']}）と2位（{second_horse['umaban']}番{second_horse['bamei']}）の差が{shisu_gap}ptと非常に僅差（または地力1位が別馬）です。1着固定だけでなく『⑧ 精鋭5頭BOX(10点)』や『⑨ 頭逆転フォーメーション』の併用が効果的です。"
-
-    axis_analysis = {
-        "confidence_level": conf_level,
-        "badge_text": conf_badge,
-        "shisu_gap": shisu_gap,
-        "advice": conf_advice,
-        "dangerous_favorite": dangerous_fav_info
-    }
-
-    # =========================================================
-    # 既存7種の馬券構築
-    # =========================================================
     row1 = [axis_umaban]
     row2 = main_2nd_umabans
     row3 = main_2nd_umabans + saver_3rd_umabans
@@ -2177,60 +2147,12 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
                 if a != b and b != c and a != c:
                     sanrentan_form_combos.append(f"{a} → {b} → {c}")
 
-    # =========================================================
-    # ★アプローチ⑤-2: ⑧ 軸飛び・タテ目防御「精鋭5頭 3連複BOX（計10点）」
-    # （軸馬＋2列目本線＋地力上位から5頭を選抜。軸が飛んでも残り4頭のタテ目4通りで高配当を拾う）
-    # =========================================================
-    box_candidates = [axis_umaban]
-    for u in main_2nd_umabans:
-        if u not in box_candidates and len(box_candidates) < 5:
-            box_candidates.append(u)
-    for u in saver_3rd_umabans:
-        if u not in box_candidates and len(box_candidates) < 5:
-            box_candidates.append(u)
-    if len(box_candidates) < 5:
-        for h in by_stage2:
-            if h["umaban"] not in box_candidates and h["umaban"] not in eliminated_umabans:
-                box_candidates.append(h["umaban"])
-                if len(box_candidates) >= 5:
-                    break
-
-    box_sorted = sorted(box_candidates)
-    tateme_box_all_combos = []
-    pure_tateme_combos = []  # 軸馬(axis_umaban)抜きの純タテ目決着（4点）
-    for i in range(len(box_sorted)):
-        for j in range(i + 1, len(box_sorted)):
-            for k in range(j + 1, len(box_sorted)):
-                c_str = f"{box_sorted[i]} - {box_sorted[j]} - {box_sorted[k]}"
-                tateme_box_all_combos.append(c_str)
-                if axis_umaban not in (box_sorted[i], box_sorted[j], box_sorted[k]):
-                    pure_tateme_combos.append(c_str)
-
-    # =========================================================
-    # ★アプローチ⑤-3: ⑨ 頭逆転（2列目本線1着 ➔ 軸馬・本線2〜3着）3連単フォーメーション
-    # =========================================================
-    rev_first = main_2nd_umabans[:2] if len(main_2nd_umabans) >= 2 else main_2nd_umabans
-    rev_second = [axis_umaban] + main_2nd_umabans
-    rev_third_pool = [axis_umaban] + main_2nd_umabans + saver_3rd_umabans[:2]
-    rev_third = []
-    for u in rev_third_pool:
-        if u not in rev_third:
-            rev_third.append(u)
-
-    gyakuten_sanrentan_combos = []
-    for a in rev_first:
-        for b in rev_second:
-            for c in rev_third:
-                if a != b and b != c and a != c:
-                    gyakuten_sanrentan_combos.append(f"{a} → {b} → {c}")
-
     eliminated_details = [
         {"umaban": h["umaban"], "bamei": h["bamei"], "reason": h["role_label"], "odds": h["odds"]}
         for h in by_stage2 if h["umaban"] in eliminated_umabans
     ]
 
     return {
-        "axis_analysis": axis_analysis,
         "formation_groups": {
             "axis_1st": [{"umaban": axis_horse["umaban"], "bamei": axis_horse["bamei"], "shisu": axis_horse["shisu"], "stage1_shisu": axis_horse["stage1_shisu"], "odds": axis_horse["odds"]}],
             "main_2nd": [{"umaban": h["umaban"], "bamei": h["bamei"], "shisu": h["shisu"], "stage1_shisu": h["stage1_shisu"], "myoumi": h["myoumi"], "odds": h["odds"]} for h in main_2nd_horses],
@@ -2253,21 +2175,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         "sanrenpuku_nagashi": {"axis": axis_umaban, "targets": row3, "combos": sanrenpuku_nagashi_combos, "count": len(sanrenpuku_nagashi_combos)},
         "sanrenpuku_formation": {"row1": row1, "row2": row2, "row3": row3, "combos": sanrenpuku_form_combos, "count": len(sanrenpuku_form_combos)},
         "sanrentan_nagashi": {"first": axis_umaban, "targets": row3, "combos": sanrentan_nagashi_combos, "count": len(sanrentan_nagashi_combos)},
-        "sanrentan_formation": {"first": row1, "second": row2, "third": row3, "combos": sanrentan_form_combos, "count": len(sanrentan_form_combos)},
-        "tateme_sanrenpuku_box": {
-            "horses": box_sorted,
-            "combos": tateme_box_all_combos,
-            "pure_tateme_combos": pure_tateme_combos,
-            "count": len(tateme_box_all_combos),
-            "pure_tateme_count": len(pure_tateme_combos)
-        },
-        "gyakuten_sanrentan_formation": {
-            "first": rev_first,
-            "second": rev_second,
-            "third": rev_third,
-            "combos": gyakuten_sanrentan_combos,
-            "count": len(gyakuten_sanrentan_combos)
-        }
+        "sanrentan_formation": {"first": row1, "second": row2, "third": row3, "combos": sanrentan_form_combos, "count": len(sanrentan_form_combos)}
     }
 
 
@@ -2299,11 +2207,13 @@ def diagnose_race(request: RaceRequest):
     )
     
     place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
-    
+    total_horses_cnt = len(request.horses)
+
+    # 第1パス: 全馬のStage 1（素の地力）を算出
+    temp_items = []
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
-
         effective_zenso_for_lgb = min(zenso, 5.0) if power_score >= 0.77 else zenso
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
@@ -2350,16 +2260,52 @@ def diagnose_race(request: RaceRequest):
             '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
             '上がりタイム差分': time_diff, 'kishu_enc': kishu_enc
         }])
-        
         raw_pred = float(model.predict(input_data)[0])
         h_pci, h_pci_type = get_horse_pci_stats(horse.bamei)
 
+        temp_items.append({
+            "horse": horse,
+            "raw_pred": raw_pred,
+            "stage1_prob": stage1_prob,
+            "power_score": power_score,
+            "makuri_flag": makuri_flag,
+            "h_pci": h_pci,
+            "h_pci_type": h_pci_type,
+            "time_diff": time_diff,
+            "time_limit_mult": time_limit_mult,
+            "s2_ped_mult": s2_ped_mult,
+            "ped_label": ped_label,
+            "rot_mult": rot_mult,
+            "rot_label": rot_label,
+            "t_rank": t_rank,
+            "training_mult": training_mult
+        })
+
+    # Stage 1の偏差値と順位を先に確定
+    s1_probs = [item["stage1_prob"] for item in temp_items]
+    s1_mean = np.mean(s1_probs) if s1_probs else 0
+    s1_std = np.std(s1_probs) if s1_probs else 1
+    for item in temp_items:
+        s1_val = ((item["stage1_prob"] - s1_mean) / s1_std) * 10 + 50 if s1_std > 0 else 50.0
+        item["stage1_shisu"] = round(float(s1_val), 1)
+
+    by_s1 = sorted(temp_items, key=lambda x: x["stage1_shisu"], reverse=True)
+    for idx, item in enumerate(by_s1):
+        item["stage1_rank"] = idx + 1
+
+    # 第2パス: Stage 1順位（地力TOP3外枠保護など）を加味してStage 2最終スコアを算出
+    for item in temp_items:
+        horse = item["horse"]
         final_score, bias_mult, pace_mult, cond_mult = calculate_comprehensive_score(
-            raw_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
+            item["raw_pred"], horse, item["power_score"], item["makuri_flag"],
+            item["h_pci"], item["h_pci_type"], item["time_diff"], 
             request.expected_pace, request.track_bias, request.bias_strength, request.cushion_value,
-            base_rpci, time_limit_mult, s2_ped_mult, rot_mult, training_mult
+            base_rpci, item["time_limit_mult"], item["s2_ped_mult"],
+            item["rot_mult"], item["training_mult"],
+            stage1_rank=item["stage1_rank"], total_horses=total_horses_cnt,
+            track_condition=request.track_condition
         )
-        
+
         records = get_active_horse_records(horse.bamei)[-5:]
         history_details = []
         for r in reversed(records):
@@ -2384,31 +2330,22 @@ def diagnose_race(request: RaceRequest):
         horses_data.append({
             "wakuban": int(horse.wakuban),
             "umaban": int(horse.umaban), "bamei": horse.bamei, "odds": float(horse.odds),
-            "stage1_prob": stage1_prob,
-            "base_prob": final_score, "time_diff": round(time_diff, 2),
-            "pci": h_pci, "pci_type": h_pci_type,
+            "stage1_prob": item["stage1_prob"],
+            "stage1_shisu": item["stage1_shisu"],
+            "stage1_rank": item["stage1_rank"],
+            "base_prob": final_score, "time_diff": round(item["time_diff"], 2),
+            "pci": item["h_pci"], "pci_type": item["h_pci_type"],
             "bataijuu": horse.bataijuu, "weight_change": horse.weight_change,
-            "training_rank": t_rank,
-            "rotation_label": rot_label,
-            "pedigree_label": ped_label,
-            "time_limit_mult": round(time_limit_mult, 2),
+            "training_rank": item["t_rank"],
+            "rotation_label": item["rot_label"],
+            "pedigree_label": item["ped_label"],
+            "time_limit_mult": round(item["time_limit_mult"], 2),
             "bias_mult": bias_mult,
             "pace_mult": pace_mult,
             "condition_mult": cond_mult,
-            "power_score": round(power_score, 2),
+            "power_score": round(item["power_score"], 2),
             "history_details": history_details 
         })
-    
-    s1_probs = [h["stage1_prob"] for h in horses_data]
-    s1_mean = np.mean(s1_probs) if s1_probs else 0
-    s1_std = np.std(s1_probs) if s1_probs else 1
-    for h in horses_data:
-        s1_val = ((h["stage1_prob"] - s1_mean) / s1_std) * 10 + 50 if s1_std > 0 else 50.0
-        h["stage1_shisu"] = round(float(s1_val), 1)
-
-    by_s1 = sorted(horses_data, key=lambda x: x["stage1_shisu"], reverse=True)
-    for idx, h in enumerate(by_s1):
-        h["stage1_rank"] = idx + 1
 
     probs = [h["base_prob"] for h in horses_data]
     mean_prob = np.mean(probs) if probs else 0
@@ -2475,13 +2412,15 @@ def simulate_race(request: RaceRequest):
     pace_l = c_stats.get('pace_last', [])
     expected_standard_time = get_expected_standard_time(c_stats, request.course_type, request.distance)
     
-    avg_req_up = float(np.mean(top3_up)) if top3_up else 35.0
-    avg_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
-    avg_pace_l = float(np.mean(pace_l)) if pace_l else 35.0
-    base_rpci = round((avg_pace_f / avg_pace_l) * 50.0, 1) if avg_pace_l > 0 else 50.0
+    base_req_up = float(np.mean(top3_up)) if top3_up else 35.0
+    base_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
+    base_pace_l = float(np.mean(pace_l)) if pace_l else 35.0
+    base_rpci = round((base_pace_f / base_pace_l) * 50.0, 1) if base_pace_l > 0 else 50.0
     
-    avg_pace_f, avg_pace_l, avg_req_up = adjust_pace_times(request.expected_pace, avg_pace_f, avg_pace_l, avg_req_up)
-    
+    avg_pace_f, avg_pace_l, avg_req_up = adjust_pace_times(request.expected_pace, base_pace_f, base_pace_l, base_req_up)
+    total_horses_cnt = len(request.horses)
+
+    temp_items = []
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
@@ -2489,6 +2428,7 @@ def simulate_race(request: RaceRequest):
 
         course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
         course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
+        time_diff_base = course_up - base_req_up
         time_diff = course_up - avg_req_up
         kishu_enc = safe_encode('kishu', horse.kishu)
         
@@ -2496,12 +2436,25 @@ def simulate_race(request: RaceRequest):
             horse.bamei, request.course_type, request.distance, 
             expected_standard_time, request.cushion_value, request.track_condition
         )
-        _, s2_ped_mult, _ = evaluate_pedigree_and_distance_aptitude(
+        s1_ped_mult, s2_ped_mult, _ = evaluate_pedigree_and_distance_aptitude(
             horse.bamei, request.course_type, request.distance, request.track_condition, request.cushion_value
         )
         rot_mult = float(horse.rotation_mult) if horse.rotation_mult else 1.00
         t_rank = str(horse.training_rank or "B").upper()
         training_mult = TRAINING_RANK_MULTIPLIERS.get(t_rank, 1.00)
+
+        stage1_input = pd.DataFrame([{
+            '枠番': 4.0, '馬番': 8.0, '斤量': horse.kinryou, '馬体重_数値': 480.0,
+            'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
+            'track_condition_enc': cond_enc, '舞台_平均前半ペース': base_pace_f, '舞台_平均後半ペース': base_pace_l,
+            '舞台_平均要求上がり': base_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': effective_zenso_for_lgb,
+            '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
+            '上がりタイム差分': time_diff_base, 'kishu_enc': kishu_enc
+        }])
+        raw_pred_stage1 = float(model.predict(stage1_input)[0])
+        stage1_prob = calculate_stage1_pure_score(
+            raw_pred_stage1, horse, power_score, time_diff_base, s1_ped_mult
+        )
         
         input_data = pd.DataFrame([{
             '枠番': horse.wakuban, '馬番': horse.umaban, '斤量': horse.kinryou, '馬体重_数値': horse.bataijuu,
@@ -2515,16 +2468,41 @@ def simulate_race(request: RaceRequest):
         raw_pred = float(model.predict(input_data)[0])
         h_pci, h_pci_type = get_horse_pci_stats(horse.bamei)
 
+        temp_items.append({
+            "horse": horse,
+            "raw_pred": raw_pred,
+            "stage1_prob": stage1_prob,
+            "power_score": power_score,
+            "makuri_flag": makuri_flag,
+            "h_pci": h_pci,
+            "h_pci_type": h_pci_type,
+            "time_diff": time_diff,
+            "time_limit_mult": time_limit_mult,
+            "s2_ped_mult": s2_ped_mult,
+            "rot_mult": rot_mult,
+            "training_mult": training_mult
+        })
+
+    by_s1 = sorted(temp_items, key=lambda x: x["stage1_prob"], reverse=True)
+    for idx, item in enumerate(by_s1):
+        item["stage1_rank"] = idx + 1
+
+    for item in temp_items:
+        horse = item["horse"]
         final_score, _, _, _ = calculate_comprehensive_score(
-            raw_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
+            item["raw_pred"], horse, item["power_score"], item["makuri_flag"],
+            item["h_pci"], item["h_pci_type"], item["time_diff"], 
             request.expected_pace, request.track_bias, request.bias_strength, request.cushion_value,
-            base_rpci, time_limit_mult, s2_ped_mult, rot_mult, training_mult
+            base_rpci, item["time_limit_mult"], item["s2_ped_mult"],
+            item["rot_mult"], item["training_mult"],
+            stage1_rank=item["stage1_rank"], total_horses=total_horses_cnt,
+            track_condition=request.track_condition
         )
         
         horses_data.append({
             "umaban": int(horse.umaban), "bamei": horse.bamei, "odds": float(horse.odds),
-            "base_prob": final_score, "time_diff": round(time_diff, 2),
-            "pci": h_pci, "pci_type": h_pci_type
+            "base_prob": final_score, "time_diff": round(item["time_diff"], 2),
+            "pci": item["h_pci"], "pci_type": item["h_pci_type"]
         })
     
     probs = [h["base_prob"] for h in horses_data]
