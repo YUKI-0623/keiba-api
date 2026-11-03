@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import requests
 from io import StringIO
+from urllib.parse import quote
 import re
 import time
 import random
@@ -15,7 +16,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (前年/今年度タイム・上り3F＆過去5走履歴完全対応版)")
+app = FastAPI(title="競馬シミュレーションAPI (全レース正確な前年結果検索＆過去5走履歴完全対応版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -263,9 +264,6 @@ def infer_margin_seconds(record: dict) -> float:
 
 
 def build_horse_history_details(bamei_str: str, place_dict: Dict[str, str]) -> List[Dict[str, str]]:
-    """
-    各馬の過去5走履歴（レース名、距離、着順、タイム、上り3F、走行順位）を整形して返すヘルパー関数
-    """
     records = get_active_horse_records(bamei_str)[-5:]
     history_details = []
     for r in reversed(records):
@@ -312,13 +310,131 @@ def build_horse_history_details(bamei_str: str, place_dict: Dict[str, str]) -> L
     return history_details
 
 
-def parse_race_result_benchmark_from_html(html_text: str, label_prefix: str) -> Optional[Dict[str, Any]]:
+def normalize_race_title(raw_title: str) -> str:
+    """
+    『第173回天皇賞（春）(G1) 出馬表 | ...』などから純粋なレース名『天皇賞(春)』を抽出・正規化する
+    """
+    if not raw_title:
+        return ""
+    s = str(raw_title)
+    s = re.split(r'[|｜]', s)[0]
+    s = re.sub(r'出馬表.*$', '', s)
+    s = re.sub(r'結果・払戻.*$', '', s)
+    s = re.sub(r'データ分析.*$', '', s)
+    s = re.sub(r'第\d+回\s*', '', s)
+    s = s.replace('（', '(').replace('）', ')')
+    s = s.translate(str.maketrans('０１２３４５６７８９ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ', '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'))
+    s = re.sub(r'\((?:G1|G2|G3|GI|GII|GIII|J\.G1|J\.G2|J\.G3|L|OP)\)', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'【.*?】', '', s)
+    s = re.sub(r'\s+', '', s).strip()
+    return s
+
+
+def is_generic_class_race_name(clean_name: str) -> bool:
+    if not clean_name:
+        return True
+    generic_keywords = ['新馬', '未勝利', '1勝クラス', '2勝クラス', '3勝クラス', '500万下', '1000万下', '1600万下', 'オープン']
+    return any(kw in clean_name for kw in generic_keywords)
+
+
+def is_same_race_series(target_clean: str, cand_clean: str) -> bool:
+    """
+    2つの正規化済みレース名が同一レース（または同一重賞・特別戦）を指しているかを判定
+    """
+    if not target_clean or not cand_clean:
+        return False
+    if target_clean == cand_clean:
+        return True
+
+    # 天皇賞(春) と 天皇賞(秋) の混同を防止
+    if "天皇賞" in target_clean or "天皇賞" in cand_clean:
+        if ("春" in target_clean) != ("春" in cand_clean):
+            return False
+        if ("秋" in target_clean) != ("秋" in cand_clean):
+            return False
+        return "天皇賞" in target_clean and "天皇賞" in cand_clean
+
+    # タイトルが片方に含まれる場合（例: 『ステークス』と『S』の表記揺れ対応）
+    t_short = target_clean.replace('ステークス', 'S').replace('カップ', 'C').replace('記念', '')
+    c_short = cand_clean.replace('ステークス', 'S').replace('カップ', 'C').replace('記念', '')
+    if t_short and c_short and (t_short == c_short or t_short in c_short or c_short in t_short):
+        return True
+
+    return False
+
+
+def extract_html_race_metadata(html_text: str) -> tuple[str, Optional[str], Optional[int]]:
+    """
+    結果HTMLまたはDBのHTMLから (正規化レース名, コース種別[芝/ダ/障], 距離[m]) を抽出
+    """
+    title_str = ""
+    m_rname = re.search(r'<div[^>]*class="[^"]*RaceName[^"]*"[^>]*>(.*?)</div>', html_text, re.IGNORECASE | re.DOTALL)
+    if m_rname:
+        title_str = re.sub(r'<[^>]*>', '', m_rname.group(1)).strip()
+    if not title_str:
+        m_h1 = re.search(r'<h1[^>]*>(.*?)</h1>', html_text, re.IGNORECASE | re.DOTALL)
+        if m_h1:
+            title_str = re.sub(r'<[^>]*>', '', m_h1.group(1)).strip()
+    if not title_str:
+        m_title = re.search(r'<title>(.*?)</title>', html_text, re.IGNORECASE | re.DOTALL)
+        if m_title:
+            title_str = re.sub(r'<[^>]*>', '', m_title.group(1)).strip()
+
+    clean_title = normalize_race_title(title_str)
+
+    # コース・距離の抽出 (例: 『芝3200m』、『芝右 外3200m』、『ダ1800m』など)
+    c_type = None
+    dist_val = None
+    m_td = re.search(r'(芝|ダート|ダ|障害|障)\s*(?:右|左|直|外|内|\s|・)*?(\d{3,4})\s*m', html_text)
+    if m_td:
+        raw_t = m_td.group(1)
+        if raw_t in ['ダート', 'ダ']:
+            c_type = 'ダ'
+        elif raw_t in ['障害', '障']:
+            c_type = '障'
+        else:
+            c_type = '芝'
+        dist_val = int(m_td.group(2))
+
+    return clean_title, c_type, dist_val
+
+
+def parse_race_result_benchmark_from_html(
+    html_text: str,
+    label_prefix: str,
+    expected_course_type: Optional[str] = None,
+    expected_distance: Optional[int] = None,
+    expected_race_name: Optional[str] = None,
+    strict_validation: bool = False
+) -> Optional[Dict[str, Any]]:
     """
     netkeibaのresult.htmlまたはdb.netkeiba.comのレース結果HTMLから
-    1着ゴールタイム、および1〜3着の馬番・馬名・タイム・上がり3F・通過順を抽出する
+    1着ゴールタイム、および1〜3着の馬番・馬名・タイム・上がり3F・通過順を抽出する。
+    strict_validation=True の場合、コース種別・距離・レース名・勝ち時計の妥当性を厳密検証し、別レースならNoneを返す。
     """
     if "HorseList" not in html_text and "race_table_01" not in html_text:
         return None
+
+    cand_clean_title, cand_course_type, cand_distance = extract_html_race_metadata(html_text)
+    target_clean_title = normalize_race_title(expected_race_name or "")
+    is_named_race = not is_generic_class_race_name(target_clean_title)
+
+    if strict_validation:
+        # 1. 芝・ダート種別の不一致をブロック
+        if expected_course_type and cand_course_type and expected_course_type != cand_course_type:
+            return None
+
+        # 2. レース名の検証（重賞・特別戦なら同一レース名シリーズであることを要求）
+        if is_named_race and target_clean_title and cand_clean_title:
+            if not is_same_race_series(target_clean_title, cand_clean_title):
+                return None
+            # 重賞・特別戦でも距離差が400m以上あれば別レースとみなす（天皇賞春3200m vs 秋2000mなど）
+            if expected_distance and cand_distance and abs(expected_distance - cand_distance) > 400:
+                return None
+        else:
+            # 条件戦（未勝利・1〜3勝クラス等）の場合は距離の完全一致を要求
+            if expected_distance and cand_distance and expected_distance != cand_distance:
+                return None
 
     rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html_text, re.DOTALL | re.IGNORECASE)
     if not rows:
@@ -370,10 +486,9 @@ def parse_race_result_benchmark_from_html(html_text: str, label_prefix: str) -> 
                 passing_str = m_ps.group(1)
 
         up_str = "-"
-        # 上がり3Fセルの抽出（32.0〜42.9秒の範囲）
         for td_cell in reversed(tds[7:]):
             c_txt = re.sub(r'<[^>]*>', '', td_cell).strip()
-            if re.match(r'^(3[1-9]\.\d|4[0-2]\.\d)$', c_txt):
+            if re.match(r'^(3[0-9]\.\d|4[0-5]\.\d)$', c_txt):
                 up_str = c_txt
                 break
 
@@ -397,11 +512,24 @@ def parse_race_result_benchmark_from_html(html_text: str, label_prefix: str) -> 
     if winner_time == "-":
         return None
 
+    # 3. 勝ち時計の物理的妥当性ガード（例: 3200m戦なのに1:50.4のような別距離タイムが混入するのを完全に防止）
+    if expected_distance:
+        win_sec = parse_time_to_seconds(winner_time)
+        if win_sec is not None:
+            min_plausible_sec = expected_distance * 0.052
+            max_plausible_sec = expected_distance * 0.075
+            if not (min_plausible_sec <= win_sec <= max_plausible_sec):
+                return None
+
     year_m = re.search(r'(20\d{2})年', html_text)
     year_str = f"{year_m.group(1)}年" if year_m else label_prefix
 
+    display_label = label_prefix
+    if cand_clean_title and cand_clean_title not in label_prefix:
+        display_label = f"{label_prefix} [{cand_clean_title}]"
+
     return {
-        "label": label_prefix,
+        "label": display_label,
         "year_label": year_str,
         "winner_time": winner_time,
         "winner_bamei": top3_list[0]["bamei"],
@@ -410,12 +538,110 @@ def parse_race_result_benchmark_from_html(html_text: str, label_prefix: str) -> 
     }
 
 
+def find_prev_year_race_ids_by_name_and_data_page(
+    race_id: str,
+    target_year: int,
+    race_name: str,
+    course_type: str,
+    distance: int,
+    headers: dict
+) -> List[str]:
+    """
+    開催日程のズレ（回・日数の変化）に対応するため、
+    ① netkeibaのdata_list.html（データ分析ページ）内の過去同レースリンク
+    ② db.netkeiba.com / db.sp.netkeiba.com のレース名検索
+    から、前年（target_year）の正確な12桁レースID候補リストを取得する
+    """
+    candidate_ids: List[str] = []
+    target_clean = normalize_race_title(race_name)
+
+    # ① data_list.html（または data_top.html）から過去同レースのrace_idを抽出
+    for data_page in ["data_list.html", "data_top.html"]:
+        try:
+            time.sleep(0.15)
+            d_url = f"https://race.netkeiba.com/race/{data_page}?race_id={race_id}"
+            res_d = requests.get(d_url, headers=headers, timeout=5)
+            if res_d.status_code == 200:
+                res_d.encoding = res_d.apparent_encoding
+                found_ids = re.findall(rf'\b({target_year}\d{{8}})\b', res_d.text)
+                for fid in found_ids:
+                    if fid not in candidate_ids:
+                        candidate_ids.append(fid)
+                if candidate_ids:
+                    break
+        except:
+            continue
+
+    # ② 重賞・特別戦の場合は db.netkeiba.com のレース名検索を実行
+    if not is_generic_class_race_name(target_clean) and len(target_clean) >= 2:
+        # 検索ワードの作成（例: 『天皇賞(春)』なら『天皇賞』で検索して行ごとに(春)/(秋)や距離をフィルタ）
+        search_keyword = re.sub(r'\(.*?\)', '', target_clean).strip()
+        if len(search_keyword) < 2:
+            search_keyword = target_clean
+
+        try:
+            euc_word = quote(search_keyword.encode('euc-jp', errors='ignore'))
+            search_urls = [
+                f"https://db.netkeiba.com/?pid=race_list&word={euc_word}",
+                f"https://db.sp.netkeiba.com/?pid=race_list&word={euc_word}"
+            ]
+            for s_url in search_urls:
+                try:
+                    time.sleep(0.15)
+                    res_s = requests.get(s_url, headers=headers, timeout=6)
+                    if res_s.status_code != 200:
+                        continue
+                    res_s.encoding = 'euc-jp' if 'euc-jp' in res_s.text.lower() else res_s.apparent_encoding
+                    s_html = res_s.text
+
+                    tr_blocks = re.findall(r'<tr[^>]*>(.*?)</tr>', s_html, re.DOTALL | re.IGNORECASE)
+                    for tr in tr_blocks:
+                        m_id = re.search(rf'/race/({target_year}\d{{8}})/?', tr)
+                        if not m_id:
+                            continue
+                        cand_id = m_id.group(1)
+                        tr_clean = re.sub(r'<[^>]*>', ' ', tr)
+                        tr_clean = re.sub(r'\s+', ' ', tr_clean).strip()
+
+                        # 天皇賞(春)と天皇賞(秋)の区別（春は4〜5月・3200m、秋は10〜11月・2000m）
+                        if "天皇賞" in target_clean:
+                            if "春" in target_clean and ("秋" in tr_clean or "2000" in tr_clean):
+                                continue
+                            if "秋" in target_clean and ("春" in tr_clean or "3200" in tr_clean):
+                                continue
+
+                        # 距離またはコース種別が表記されていればチェック
+                        m_dist = re.search(r'(芝|ダ|障)\s*(\d{3,4})', tr_clean)
+                        if m_dist:
+                            if m_dist.group(1) != course_type:
+                                continue
+                            if abs(int(m_dist.group(2)) - distance) > 400:
+                                continue
+
+                        if cand_id not in candidate_ids:
+                            candidate_ids.append(cand_id)
+
+                    if candidate_ids:
+                        break
+                except:
+                    continue
+        except:
+            pass
+
+    return candidate_ids
+
+
 def fetch_reference_race_benchmarks(
-    race_id: str, headers: dict, c_stats: dict, course_type: str, distance: int
+    race_id: str,
+    headers: dict,
+    c_stats: dict,
+    course_type: str,
+    distance: int,
+    race_name: str = ""
 ) -> Dict[str, Any]:
     """
-    ・レース終了後の場合: 今年度（当該レース確定結果）の1着タイム＆1〜3着上り3F ＋ 前年度の結果を取得
-    ・レース発走前の場合: 前年度（昨年同条件レース）の1着タイム＆1〜3着上り3Fを取得
+    ・レース終了後の場合: 今年度（当該レース確定結果）の1着タイム＆1〜3着上り3F ＋ 前年度の正確な同レース結果を取得
+    ・レース発走前の場合: 前年度（昨年同レース）の1着タイム＆1〜3着上り3Fを取得
     """
     current_year_bench = None
     prev_year_bench = None
@@ -429,42 +655,82 @@ def fetch_reference_race_benchmarks(
         if res_cur.status_code == 200:
             res_cur.encoding = res_cur.apparent_encoding
             current_year_bench = parse_race_result_benchmark_from_html(
-                res_cur.text, f"今年度確定 ({race_id[:4]}年)"
+                res_cur.text,
+                f"今年度確定 ({race_id[:4]}年)",
+                expected_course_type=course_type,
+                expected_distance=distance,
+                expected_race_name=race_name,
+                strict_validation=False
             )
     except:
         pass
 
-    # 2. 前年度（年を-1した同一開催ID）の結果チェック
+    # 2. 前年度（同一レース）の正確な結果検索＆検証
     if len(race_id) == 12 and race_id.isdigit():
         prev_year = int(race_id[:4]) - 1
-        prev_race_id = f"{prev_year}{race_id[4:]}"
-        prev_urls = [
-            f"https://race.netkeiba.com/race/result.html?race_id={prev_race_id}",
-            f"https://db.netkeiba.com/race/{prev_race_id}/"
-        ]
-        for p_url in prev_urls:
-            try:
-                time.sleep(0.15)
-                res_prev = requests.get(p_url, headers=headers, timeout=6)
-                if res_prev.status_code == 200:
-                    res_prev.encoding = res_prev.apparent_encoding
-                    parsed_p = parse_race_result_benchmark_from_html(
-                        res_prev.text, f"前年実績 ({prev_year}年)"
-                    )
-                    if parsed_p:
-                        prev_year_bench = parsed_p
-                        break
-            except:
-                continue
+        place_code = race_id[4:6]
+        kai_num = int(race_id[6:8])
+        day_num = int(race_id[8:10])
+        r_num = int(race_id[10:12])
 
-    # 3. コース基準値フォールバック（万が一前年HTMLがなかった場合用）
+        # 候補IDリストの構築：
+        # (A) データ分析ページ＆DBレース名検索から特定した正確な前年同レースID
+        # (B) 同一開催回・日数のID（厳密バリデーション付き）
+        # (C) 開催回が1つズレたケース（例: 3回京都4日11R ➔ 2回京都4日11R）
+        search_ids = find_prev_year_race_ids_by_name_and_data_page(
+            race_id, prev_year, race_name, course_type, distance, headers
+        )
+
+        direct_prev_id = f"{prev_year}{race_id[4:]}"
+        if direct_prev_id not in search_ids:
+            search_ids.append(direct_prev_id)
+
+        for k_diff in [-1, 1]:
+            adj_kai = kai_num + k_diff
+            if 1 <= adj_kai <= 6:
+                adj_id = f"{prev_year}{place_code}{adj_kai:02d}{day_num:02d}{r_num:02d}"
+                if adj_id not in search_ids:
+                    search_ids.append(adj_id)
+
+        for cand_prev_id in search_ids[:6]:
+            prev_urls = [
+                f"https://db.netkeiba.com/race/{cand_prev_id}/",
+                f"https://race.netkeiba.com/race/result.html?race_id={cand_prev_id}"
+            ]
+            for p_url in prev_urls:
+                try:
+                    time.sleep(0.15)
+                    res_prev = requests.get(p_url, headers=headers, timeout=6)
+                    if res_prev.status_code == 200:
+                        if "db.netkeiba.com" in p_url:
+                            res_prev.encoding = 'euc-jp' if 'euc-jp' in res_prev.text.lower() else res_prev.apparent_encoding
+                        else:
+                            res_prev.encoding = res_prev.apparent_encoding
+
+                        parsed_p = parse_race_result_benchmark_from_html(
+                            res_prev.text,
+                            f"前年実績 ({prev_year}年)",
+                            expected_course_type=course_type,
+                            expected_distance=distance,
+                            expected_race_name=race_name,
+                            strict_validation=True
+                        )
+                        if parsed_p:
+                            prev_year_bench = parsed_p
+                            break
+                except:
+                    continue
+            if prev_year_bench:
+                break
+
+    # 3. コース基準値フォールバック（新設レース等で前年が存在しない場合）
     std_sec = get_expected_standard_time(c_stats, course_type, distance)
     std_time_str = format_seconds_to_time_str(std_sec)
     top3_up_list = c_stats.get('top3_up', [])
     avg_up_str = f"{float(np.mean(top3_up_list)):.1f}" if top3_up_list else "34.8"
 
     fallback_bench = {
-        "label": "同舞台コース基準値",
+        "label": f"同舞台コース基準値 ({course_type}{distance}m)",
         "year_label": "コース統計平均",
         "winner_time": std_time_str,
         "winner_bamei": "同舞台平均",
@@ -1907,7 +2173,6 @@ def fetch_race(race_id: str):
                     reason_parts.append(ped_summary)
                 combined_reason = " / ".join(reason_parts)
 
-                # 各馬の過去5走履歴を整形
                 history_details = build_horse_history_details(bamei, place_dict)
 
                 horses_data.append({
@@ -1940,9 +2205,9 @@ def fetch_race(race_id: str):
         c_stats = course_history_db.get(course_key, {})
         rpci, rpci_type, _ = get_course_rpci_stats(course_key)
 
-        # ★新機能: 今年度（終了後）または前年度（発走前）の1着ゴールタイム＆1〜3着上がり3Fを取得
+        # ★修正版: レース名・コース・距離を厳密照合して正確な前年同レース結果を特定
         reference_benchmarks = fetch_reference_race_benchmarks(
-            race_id, headers, c_stats, track_type, distance
+            race_id, headers, c_stats, track_type, distance, race_name=race_name
         )
 
         auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
@@ -2548,7 +2813,6 @@ def diagnose_race(request: RaceRequest):
             track_condition=request.track_condition
         )
 
-        # ★過去5走の詳細履歴（レース名、距離、着順、タイム、上り3F、走行順位）を生成
         history_details = build_horse_history_details(horse.bamei, place_dict)
 
         horses_data.append({
