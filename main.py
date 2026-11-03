@@ -15,7 +15,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (高速馬場上がり補正＆地力上位外枠保護・対抗穴攻め対応版)")
+app = FastAPI(title="競馬シミュレーションAPI (前年/今年度タイム・上り3F＆過去5走履歴完全対応版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -150,6 +150,14 @@ def parse_time_to_seconds(time_val):
     except:
         return None
 
+def format_seconds_to_time_str(sec_val: float) -> str:
+    try:
+        m = int(sec_val // 60)
+        s = sec_val - (m * 60)
+        return f"{m}:{s:04.1f}"
+    except:
+        return "-"
+
 def parse_date_str(d_str: str) -> Optional[datetime]:
     if not d_str:
         return None
@@ -252,6 +260,231 @@ def infer_margin_seconds(record: dict) -> float:
         else: return 1.25
     except:
         return 0.75
+
+
+def build_horse_history_details(bamei_str: str, place_dict: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    各馬の過去5走履歴（レース名、距離、着順、タイム、上り3F、走行順位）を整形して返すヘルパー関数
+    """
+    records = get_active_horse_records(bamei_str)[-5:]
+    history_details = []
+    for r in reversed(records):
+        course_raw = str(r.get('course', '05_芝_2000'))
+        parts = course_raw.split('_')
+        p_code = parts[0] if len(parts) >= 1 else '05'
+        c_type = parts[1] if len(parts) >= 2 else '芝'
+        dist = parts[2] if len(parts) >= 3 else '2000'
+        place = place_dict.get(p_code, "地方")
+        cond_str = str(r.get('cond', '良'))
+
+        raw_rname = str(r.get('race_name', '')).strip()
+        grade_s = str(r.get('grade', '')).strip()
+        distance_label = f"{place}{c_type}{dist}m({cond_str})"
+
+        if raw_rname:
+            if grade_s and grade_s not in raw_rname:
+                display_race_name = f"{raw_rname}({grade_s})"
+            else:
+                display_race_name = raw_rname
+        else:
+            display_race_name = f"{place} {c_type}{dist}m ({cond_str})"
+
+        single_pci = calc_single_pci(course_raw, r.get('time', ''), r.get('up', ''))
+        rank_num = r.get('rank', 99)
+        try:
+            rank_str = f"{int(float(rank_num))}着"
+        except:
+            rank_str = "-"
+
+        up_raw = str(r.get('up', '-')).strip()
+        up_str = f"{up_raw}秒" if up_raw not in ['-', '', 'None'] else "-"
+
+        history_details.append({
+            "date": str(r.get('date', '')),
+            "race_name": display_race_name,
+            "distance": distance_label,
+            "rank": rank_str,
+            "time": str(r.get('time', '-')),
+            "up": up_str,
+            "passing": str(r.get('passing', '-')),
+            "pci": f"{single_pci}" if single_pci is not None else "-"
+        })
+    return history_details
+
+
+def parse_race_result_benchmark_from_html(html_text: str, label_prefix: str) -> Optional[Dict[str, Any]]:
+    """
+    netkeibaのresult.htmlまたはdb.netkeiba.comのレース結果HTMLから
+    1着ゴールタイム、および1〜3着の馬番・馬名・タイム・上がり3F・通過順を抽出する
+    """
+    if "HorseList" not in html_text and "race_table_01" not in html_text:
+        return None
+
+    rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html_text, re.DOTALL | re.IGNORECASE)
+    if not rows:
+        rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html_text, re.DOTALL | re.IGNORECASE)
+
+    top3_list = []
+    for row in rows:
+        tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+        if len(tds) < 8:
+            continue
+
+        rank_str = re.sub(r'<[^>]*>', '', tds[0]).strip()
+        if not rank_str.isdigit():
+            continue
+        rk = int(rank_str)
+        if rk < 1 or rk > 3:
+            continue
+
+        umaban = 0
+        if len(tds) >= 3:
+            u_cand = re.sub(r'<[^>]*>', '', tds[2]).strip()
+            if u_cand.isdigit():
+                umaban = int(u_cand)
+
+        bamei = ""
+        b_m = re.search(r'<span[^>]*class="[^"]*Horse_Name[^"]*"[^>]*>(.*?)</span>', row, re.IGNORECASE | re.DOTALL)
+        if not b_m:
+            b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', row, re.IGNORECASE | re.DOTALL)
+        if b_m:
+            bamei = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
+
+        row_clean = re.sub(r'<[^>]*>', ' ', row)
+        row_clean = re.sub(r'\s+', ' ', row_clean).strip()
+
+        time_str = "-"
+        m_tm = re.search(r'(\d:\d{2}\.\d)', row_clean)
+        if m_tm:
+            time_str = m_tm.group(1)
+
+        passing_str = "-"
+        p_m = re.search(r'<td[^>]*class="[^"]*PassageRate[^"]*"[^>]*>(.*?)</td>', row, re.IGNORECASE | re.DOTALL)
+        if p_m:
+            p_cand = re.sub(r'<[^>]*>', '', p_m.group(1)).strip()
+            if p_cand:
+                passing_str = p_cand
+        if passing_str == "-":
+            m_ps = re.search(r'\b(\d{1,2}(?:-\d{1,2})+)\b', row_clean)
+            if m_ps:
+                passing_str = m_ps.group(1)
+
+        up_str = "-"
+        # 上がり3Fセルの抽出（32.0〜42.9秒の範囲）
+        for td_cell in reversed(tds[7:]):
+            c_txt = re.sub(r'<[^>]*>', '', td_cell).strip()
+            if re.match(r'^(3[1-9]\.\d|4[0-2]\.\d)$', c_txt):
+                up_str = c_txt
+                break
+
+        top3_list.append({
+            "rank": rk,
+            "umaban": umaban,
+            "bamei": bamei or f"{umaban}番",
+            "time": time_str,
+            "up": up_str,
+            "passing": passing_str
+        })
+
+        if len(top3_list) >= 3:
+            break
+
+    if not top3_list:
+        return None
+
+    top3_list.sort(key=lambda x: x["rank"])
+    winner_time = top3_list[0]["time"] if top3_list else "-"
+    if winner_time == "-":
+        return None
+
+    year_m = re.search(r'(20\d{2})年', html_text)
+    year_str = f"{year_m.group(1)}年" if year_m else label_prefix
+
+    return {
+        "label": label_prefix,
+        "year_label": year_str,
+        "winner_time": winner_time,
+        "winner_bamei": top3_list[0]["bamei"],
+        "winner_umaban": top3_list[0]["umaban"],
+        "top3": top3_list
+    }
+
+
+def fetch_reference_race_benchmarks(
+    race_id: str, headers: dict, c_stats: dict, course_type: str, distance: int
+) -> Dict[str, Any]:
+    """
+    ・レース終了後の場合: 今年度（当該レース確定結果）の1着タイム＆1〜3着上り3F ＋ 前年度の結果を取得
+    ・レース発走前の場合: 前年度（昨年同条件レース）の1着タイム＆1〜3着上り3Fを取得
+    """
+    current_year_bench = None
+    prev_year_bench = None
+
+    # 1. 今年度（入力されたrace_id自体）の確定結果チェック
+    try:
+        res_cur = requests.get(
+            f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
+            headers=headers, timeout=6
+        )
+        if res_cur.status_code == 200:
+            res_cur.encoding = res_cur.apparent_encoding
+            current_year_bench = parse_race_result_benchmark_from_html(
+                res_cur.text, f"今年度確定 ({race_id[:4]}年)"
+            )
+    except:
+        pass
+
+    # 2. 前年度（年を-1した同一開催ID）の結果チェック
+    if len(race_id) == 12 and race_id.isdigit():
+        prev_year = int(race_id[:4]) - 1
+        prev_race_id = f"{prev_year}{race_id[4:]}"
+        prev_urls = [
+            f"https://race.netkeiba.com/race/result.html?race_id={prev_race_id}",
+            f"https://db.netkeiba.com/race/{prev_race_id}/"
+        ]
+        for p_url in prev_urls:
+            try:
+                time.sleep(0.15)
+                res_prev = requests.get(p_url, headers=headers, timeout=6)
+                if res_prev.status_code == 200:
+                    res_prev.encoding = res_prev.apparent_encoding
+                    parsed_p = parse_race_result_benchmark_from_html(
+                        res_prev.text, f"前年実績 ({prev_year}年)"
+                    )
+                    if parsed_p:
+                        prev_year_bench = parsed_p
+                        break
+            except:
+                continue
+
+    # 3. コース基準値フォールバック（万が一前年HTMLがなかった場合用）
+    std_sec = get_expected_standard_time(c_stats, course_type, distance)
+    std_time_str = format_seconds_to_time_str(std_sec)
+    top3_up_list = c_stats.get('top3_up', [])
+    avg_up_str = f"{float(np.mean(top3_up_list)):.1f}" if top3_up_list else "34.8"
+
+    fallback_bench = {
+        "label": "同舞台コース基準値",
+        "year_label": "コース統計平均",
+        "winner_time": std_time_str,
+        "winner_bamei": "同舞台平均",
+        "winner_umaban": 0,
+        "top3": [
+            {"rank": 1, "umaban": 0, "bamei": "1着平均目安", "time": std_time_str, "up": avg_up_str, "passing": "-"},
+            {"rank": 2, "umaban": 0, "bamei": "2着平均目安", "time": "-", "up": avg_up_str, "passing": "-"},
+            {"rank": 3, "umaban": 0, "bamei": "3着平均目安", "time": "-", "up": avg_up_str, "passing": "-"},
+        ]
+    }
+
+    primary_bench = current_year_bench or prev_year_bench or fallback_bench
+    is_finished = current_year_bench is not None
+
+    return {
+        "is_finished_race": is_finished,
+        "primary": primary_bench,
+        "current_year": current_year_bench,
+        "prev_year": prev_year_bench or fallback_bench
+    }
 
 
 def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
@@ -392,6 +625,7 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                 m_rname = re.search(r'<div[^>]*class="[^"]*Data02[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
                 if m_rname:
                     race_title = re.sub(r'<[^>]*>', '', m_rname.group(1)).strip()
+                    race_title = re.sub(r'\s+', ' ', race_title)
 
                 c_type, dist_val, time_str, cond_str = "芝", 2000, "-", "良"
                 m_cd = re.search(r'(芝|ダ|障)\s*(\d{3,4})', p_text)
@@ -471,8 +705,10 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                                 ex_r["margin"] = new_r["margin"]
                             if new_r["grade"]:
                                 ex_r["grade"] = new_r["grade"]
-                            if new_r["race_name"] and not ex_r.get("race_name"):
+                            if new_r["race_name"]:
                                 ex_r["race_name"] = new_r["race_name"]
+                            if new_r["passing"] != "-":
+                                ex_r["passing"] = new_r["passing"]
                             if new_r["agari_rank"] <= 3:
                                 ex_r["agari_rank"] = new_r["agari_rank"]
                             if new_r["weight"] and not ex_r.get("weight"):
@@ -1671,6 +1907,9 @@ def fetch_race(race_id: str):
                     reason_parts.append(ped_summary)
                 combined_reason = " / ".join(reason_parts)
 
+                # 各馬の過去5走履歴を整形
+                history_details = build_horse_history_details(bamei, place_dict)
+
                 horses_data.append({
                     "wakuban": wakuban,
                     "umaban": umaban, "bamei": bamei, "kishu": kishu,
@@ -1686,7 +1925,8 @@ def fetch_race(race_id: str):
                     "shussou_kaisuu": kaisuu,
                     "pci": h_pci, "pci_type": h_pci_type,
                     "makuri_flag": makuri_flag,
-                    "power_score": round(power_score, 3)
+                    "power_score": round(power_score, 3),
+                    "history_details": history_details
                 })
             except: continue
 
@@ -1697,7 +1937,13 @@ def fetch_race(race_id: str):
                 h["wakuban"] = calc_jra_wakuban(h["umaban"], total_h)
 
         course_key = f"{place_code}_{track_type}_{distance}"
+        c_stats = course_history_db.get(course_key, {})
         rpci, rpci_type, _ = get_course_rpci_stats(course_key)
+
+        # ★新機能: 今年度（終了後）または前年度（発走前）の1着ゴールタイム＆1〜3着上がり3Fを取得
+        reference_benchmarks = fetch_reference_race_benchmarks(
+            race_id, headers, c_stats, track_type, distance
+        )
 
         auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
         auto_bias, auto_strength, bias_status, bias_msg = auto_detect_track_bias(race_id, track_type, html)
@@ -1718,6 +1964,7 @@ def fetch_race(race_id: str):
             "recommended_pace": auto_pace,
             "auto_track_bias": auto_bias,
             "auto_bias_strength": auto_strength,
+            "reference_benchmarks": reference_benchmarks,
             "auto_status": {
                 "odds_status": odds_status,
                 "odds_message": odds_msg,
@@ -1888,7 +2135,6 @@ def calculate_comprehensive_score(
 
         if power_score >= 0.72: pace_mult *= 1.05
 
-        # ★改善1: クッション値9.5以上の高速馬場ではミドル①でも「極限の上がり差分(time_diff)」を加点・減点
         if is_fast_cushion:
             if time_diff <= -0.30: pace_mult *= 1.055
             elif time_diff <= -0.05: pace_mult *= 1.025
@@ -1964,7 +2210,6 @@ def calculate_comprehensive_score(
         elif waku == 5: bias_mult = half_boost
         elif waku <= 3: bias_mult = nerf
 
-    # ★改善2: Stage 1（素の地力）TOP3の実力馬に対する外枠・バイアス減点の大幅緩和 ＆ 多頭数包まれ回避補正
     if is_elite_jiriki and bias_mult < 1.0:
         bias_mult = 1.0 - (1.0 - bias_mult) * 0.42
         if total_horses >= 15 and is_fast_cushion and waku >= 6 and kyaku >= 3 and time_diff <= 0.05:
@@ -2209,7 +2454,6 @@ def diagnose_race(request: RaceRequest):
     place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
     total_horses_cnt = len(request.horses)
 
-    # 第1パス: 全馬のStage 1（素の地力）を算出
     temp_items = []
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
@@ -2281,7 +2525,6 @@ def diagnose_race(request: RaceRequest):
             "training_mult": training_mult
         })
 
-    # Stage 1の偏差値と順位を先に確定
     s1_probs = [item["stage1_prob"] for item in temp_items]
     s1_mean = np.mean(s1_probs) if s1_probs else 0
     s1_std = np.std(s1_probs) if s1_probs else 1
@@ -2293,7 +2536,6 @@ def diagnose_race(request: RaceRequest):
     for idx, item in enumerate(by_s1):
         item["stage1_rank"] = idx + 1
 
-    # 第2パス: Stage 1順位（地力TOP3外枠保護など）を加味してStage 2最終スコアを算出
     for item in temp_items:
         horse = item["horse"]
         final_score, bias_mult, pace_mult, cond_mult = calculate_comprehensive_score(
@@ -2306,26 +2548,8 @@ def diagnose_race(request: RaceRequest):
             track_condition=request.track_condition
         )
 
-        records = get_active_horse_records(horse.bamei)[-5:]
-        history_details = []
-        for r in reversed(records):
-            p_code = str(r.get('course', '05_芝_2000')).split('_')[0]
-            place = place_dict.get(p_code, "地方")
-            try:
-                c_type = str(r['course']).split('_')[1]
-                dist = str(r['course']).split('_')[2]
-            except:
-                c_type, dist = "", ""
-            race_name = f"{place} {c_type}{dist}m ({r.get('cond', '良')})"
-            single_pci = calc_single_pci(r.get('course', ''), r.get('time', ''), r.get('up', ''))
-            history_details.append({
-                "race_name": race_name,
-                "rank": f"{int(r.get('rank', 99))}着" if 'rank' in r else "-",
-                "time": str(r.get('time', '-')),
-                "up": f"{r.get('up', '-')}秒" if r.get('up', '-') != '-' else "-",
-                "passing": r.get('passing', '-'),
-                "pci": f"{single_pci}" if single_pci is not None else "-"
-            })
+        # ★過去5走の詳細履歴（レース名、距離、着順、タイム、上り3F、走行順位）を生成
+        history_details = build_horse_history_details(horse.bamei, place_dict)
 
         horses_data.append({
             "wakuban": int(horse.wakuban),
