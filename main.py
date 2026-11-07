@@ -16,7 +16,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (完成度90%仕様: 包まれリスク印・1強保護・ラップギア解析版)")
+app = FastAPI(title="競馬シミュレーションAPI (完成度90%仕様: 持ち時計スロー補正・包まれリスク印・1強保護版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,7 +131,6 @@ TRAINING_RANK_MULTIPLIERS: Dict[str, float] = {
     "C": 0.92,
 }
 
-# 舞台×脚質別の客観的騎手適性テーブル（穴馬を消さないため減点なし・加点のみ）
 JOCKEY_STAGE_BONUSES: Dict[str, Dict[str, float]] = {
     "ルメール": {"high_speed": 1.022, "long_dist": 1.022, "outer_smooth": 1.015},
     "C.ルメール": {"high_speed": 1.022, "long_dist": 1.022, "outer_smooth": 1.015},
@@ -219,9 +218,6 @@ def extract_target_race_date(shutuba_html: str) -> Optional[datetime]:
     return None
 
 def extract_course_rail_info(shutuba_html: str) -> tuple[str, str]:
-    """
-    出馬表HTMLから芝の仮柵コース区分（Aコース、Bコース、Cコース、Dコース）を抽出する
-    """
     m_rail = re.search(r'\b([A-DＡ-Ｄ])コース\b', shutuba_html)
     if m_rail:
         rail_char = m_rail.group(1).translate(str.maketrans('ＡＢＣＤ', 'ABCD'))
@@ -316,10 +312,6 @@ def infer_margin_seconds(record: dict) -> float:
 
 
 def estimate_horse_early_3f_speed(bamei_str: str) -> float:
-    """
-    過去走の走破時計・上がり3F・距離・最初のコーナー通過順から
-    その馬の『テン3F（前半600m）の巡航スピード指数（秒換算：小さいほど速い）』を算出する
-    """
     records = get_active_horse_records(bamei_str)[-5:]
     if not records:
         return 35.8
@@ -339,7 +331,6 @@ def estimate_horse_early_3f_speed(bamei_str: str) -> float:
             if sec is None or up <= 30.0 or sec <= up:
                 continue
 
-            # 前半(dist-600m)の1ハロン平均×3 をベースに、第1コーナー通過順で微補正
             base_first_3f = ((sec - up) / (dist - 600.0)) * 600.0
             passing = str(r.get('passing', ''))
             first_corner = 6
@@ -368,11 +359,6 @@ def evaluate_lap_gear_aptitude(
     track_cond: str,
     expected_pace: str
 ) -> tuple[float, str]:
-    """
-    過去走の上がり3F絶対値・上がり順位・PCIから、
-    『⚡極限瞬発ギア（33秒台前半の瞬間加速）』と『🔥L4F持続ロンスパ力』を分離評価する。
-    ※穴馬を消さないよう減点（1.0未満）は一切行わず、合致した馬にのみ加点ボーナス（1.00〜1.04倍）を与える。
-    """
     records = get_active_horse_records(bamei_str)[-6:]
     if not records:
         return 1.00, ""
@@ -430,23 +416,16 @@ def evaluate_box_in_and_lead_risk(
     distance: int,
     cushion_val: float
 ) -> tuple[float, List[str], str]:
-    """
-    ① 多頭数×内枠差し・好位馬の『内枠包まれ（進路詰まり）リスク』判定（ただし圧倒的1強馬は保護！）
-    ② テン3F比較による『単騎ハナ・先手ボーナス』または『先行競り合い消耗注意』の判定
-    を同時に行い、(補正倍率, 戦術印バッジ配列, リスクレベル文字列) を返す。
-    """
     waku = int(round(float(horse.wakuban)))
     umaban = int(round(float(horse.umaban)))
     kyaku = int(round(float(horse.kyakushitsu)))
     odds = float(horse.odds) if horse.odds else 10.0
 
-    # 自分が圧倒的1強（Stage1が1位 かつ 2位に+3.0pt以上の大差をつけている）かどうか
     is_dominant_lone_leader = (stage1_rank == 1 and stage1_gap_to_2nd >= 3.0)
 
     my_early_info = next((x for x in all_horses_early_info if x["umaban"] == umaban), None)
     my_early_3f = my_early_info["early_3f"] if my_early_info else 35.8
 
-    # 外側から被せてくる逃げ・先行馬の頭数カウント
     outer_front_runners = sum(
         1 for x in all_horses_early_info
         if x["umaban"] > umaban and x["kyakushitsu"] <= 2 and x["early_3f"] <= my_early_3f + 0.3
@@ -457,7 +436,6 @@ def evaluate_box_in_and_lead_risk(
     badges: List[str] = []
     risk_level = "NONE"
 
-    # --- A. 逃げ・先行馬の「単騎ハナ」vs「競り合い」判定 ---
     if kyaku == 1:
         faster_or_equal_nige = [
             x for x in total_nige_horses
@@ -476,33 +454,26 @@ def evaluate_box_in_and_lead_risk(
                 risk_level = "PACE_PRESSURE"
 
     elif kyaku == 2:
-        # 好位先行で内〜中枠、かつ外から被されにくいテン3Fを持つ場合
         if waku <= 5 and outer_front_runners <= 2 and my_early_3f <= 35.4:
             tactical_mult *= 1.015
             badges.append("🎯好位先手スムーズ○")
 
-    # --- B. 多頭数×内枠（1〜3枠、または15頭立て以上の4枠差し）の「馬群包まれリスク」判定 ---
     is_crowded_field = (total_horses >= 14)
     is_inner_trap_zone = (waku <= 3) or (waku == 4 and kyaku >= 3 and total_horses >= 15)
 
     if is_crowded_field and is_inner_trap_zone:
-        # ケース1: 差し・追込脚質で内枠に入り、外から先行勢が多数被せてくる場合（マスカレードボール型）
         if kyaku >= 3 and outer_front_runners >= 3:
             if is_dominant_lone_leader:
-                # ★圧倒的1強保護: 大幅減点せず0.992倍に保護
                 tactical_mult *= 0.992
                 badges.append("🛡️1強地力(内枠包まれ克服圏)")
                 risk_level = "PROTECTED_STRONG"
             elif stage1_rank <= 5 or odds <= 10.0:
-                # 混戦の上位人気・実力馬は進路詰まりリスクが大きいためマイルド調整＋警告印
                 tactical_mult *= 0.968 if waku <= 2 else 0.975
                 badges.append("🚨多頭数イン包まれ警戒")
                 risk_level = "HIGH_BOX_RISK"
             else:
-                # 穴馬はイン突き一発の魅力もあるため減点せず印のみ
                 badges.append("💡内枠イン突き穴候補")
 
-        # ケース2: 先行脚質だが最内1〜2枠で、外にテンが速い先行馬が4頭以上いてポケットに閉じ込められる場合（クロワデュノール型）
         elif kyaku == 2 and waku <= 2 and outer_front_runners >= 4:
             if is_dominant_lone_leader:
                 tactical_mult *= 0.994
@@ -513,7 +484,6 @@ def evaluate_box_in_and_lead_risk(
                 badges.append("⚠️内枠包まれ・仕掛け遅れ注意")
                 risk_level = "MOD_BOX_RISK"
 
-    # --- C. 多頭数×外枠（6〜8枠）でも素の地力上位（Stage1 3位以内）なら「外スムーズ加速◎」印を付与 ---
     if is_crowded_field and waku >= 6 and kyaku >= 2 and stage1_rank <= 3:
         tactical_mult *= 1.015
         badges.append("🟢外枠スムーズ加速◎(包まれ回避)")
@@ -529,9 +499,6 @@ def evaluate_jockey_stage_synergy(
     cushion_val: float,
     makuri_flag: bool
 ) -> tuple[float, str]:
-    """
-    騎手×コース条件の客観シナジー（穴馬が消えないよう減点なし・合致時のみ最大+2.2%加点）
-    """
     clean_k = re.sub(r'[▲△☆◇★\s]', '', str(kishu_name or ""))
     prof = None
     for k_key, k_val in JOCKEY_STAGE_BONUSES.items():
@@ -2136,7 +2103,6 @@ def auto_detect_track_bias(
         rail_suffix = f" （{rail_msg}）" if rail_msg else ""
 
         if total_sampled_races < 2 or len(collected_top3) < 4:
-            # 過去レース結果がない場合でも、仮柵（A/Bコース開幕週など）があればヒントを提示
             if target_track_type == "芝" and day_num <= 2 and rail_code in ["A", "B"]:
                 return (
                     "イン前有利 (1〜4枠・先行)", "弱", "auto_detected",
@@ -2479,7 +2445,6 @@ def fetch_race(race_id: str):
             if not h["wakuban"] or h["wakuban"] <= 0:
                 h["wakuban"] = calc_jra_wakuban(h["umaban"], total_h)
 
-        # 出馬表取得時点での「内枠包まれ注意」「単騎ハナ」プレビュー印を付与
         early_info_preview = [
             {
                 "umaban": h["umaban"],
@@ -2493,7 +2458,7 @@ def fetch_race(race_id: str):
         p_gap = (by_power[0]["power_score"] - by_power[1]["power_score"]) * 25.0 if len(by_power) >= 2 else 0.0
         for h in horses_data:
             p_rank = next((i + 1 for i, x in enumerate(by_power) if x["umaban"] == h["umaban"]), 99)
-             DummyH = type("DummyH", (), {
+            DummyH = type("DummyH", (), {
                 "wakuban": h["wakuban"], "umaban": h["umaban"],
                 "kyakushitsu": h["kyakushitsu"], "odds": h["odds"]
             })
@@ -2553,80 +2518,99 @@ def fetch_race(race_id: str):
 
 
 def get_time_limit_multiplier(horse_name, course_type, current_distance, expected_standard_time, cushion_val, track_cond):
+    """
+    ★改善版 持ち時計評価:
+    ・スローペース（PCI 51.5以上）での走破時計遅れを最大1.2秒短縮補正して評価
+    ・キャリア4戦以下、または上がり33.9秒以下・上がり2位以内の決め手がある馬は最低でも0.97倍に保護（3着ヒモから消さない）
+    ・優秀な持ち時計には1.02倍（加点ボーナス）、減点下限も0.92倍に緩和
+    """
     is_rough_track = (track_cond in ["稍", "重", "不"]) or (cushion_val < 8.5)
-    if is_rough_track:
-        return 1.00 
-
-    if current_distance >= 2500:
+    if is_rough_track or current_distance >= 2500:
         return 1.00 
 
     h_records = get_active_horse_records(horse_name)
     if not h_records:
         return 1.00 
 
+    total_runs = len(h_records)
+
+    has_sharp_agari = False
+    for r in h_records[-5:]:
+        try:
+            up_v = float(r.get('up', 99.0))
+            ag_rk = int(r.get('agari_rank', 99))
+            rk = float(r.get('rank', 99))
+            if (course_type == "芝" and up_v <= 33.9 and rk <= 5.0) or (ag_rk <= 2 and rk <= 4.0):
+                has_sharp_agari = True
+                break
+        except:
+            continue
+
     best_diff_per_halon = None
     cur_halons = current_distance / 200.0
     
-    same_dist_times = []
+    same_dist_diffs = []
+    adjacent_diffs = []
+
     for r in h_records:
         r_c = str(r.get('course', ''))
         r_cond = str(r.get('cond', ''))
         t_sec = parse_time_to_seconds(r.get('time'))
-        if t_sec is None: continue
-        
-        if course_type in r_c:
-            m = re.search(r'(\d{3,4})', r_c)
-            if m:
-                dist = int(m.group(1))
-                if dist == current_distance and r_cond in ['良', '稍']:
-                    same_dist_times.append(t_sec)
-                    
-    if same_dist_times:
-        best_time = min(same_dist_times)
-        best_diff_per_halon = (best_time - expected_standard_time) / cur_halons
-    else:
-        adjacent_diffs = []
-        for r in h_records:
-            r_c = str(r.get('course', ''))
-            r_cond = str(r.get('cond', ''))
-            t_sec = parse_time_to_seconds(r.get('time'))
-            if t_sec is None: continue
-            
-            if course_type in r_c:
-                m = re.search(r'(\d{3,4})', r_c)
-                if m:
-                    dist = int(m.group(1))
-                    if 0 < abs(dist - current_distance) <= 400 and r_cond in ['良', '稍']:
-                        adj_stats = course_history_db.get(r_c, {})
-                        adj_std = adj_stats.get('standard_time')
-                        if adj_std is not None:
-                            adj_diff = (t_sec - float(adj_std)) / (dist / 200.0)
-                        else:
-                            halon_gap = (current_distance - dist) / 200.0
-                            pace_penalty = halon_gap * 0.45 if halon_gap > 0 else halon_gap * 0.35
-                            projected_time = (t_sec * (current_distance / dist)) + pace_penalty
-                            adj_diff = (projected_time - expected_standard_time) / cur_halons
-                        adjacent_diffs.append(adj_diff)
-        
-        if adjacent_diffs:
-            best_diff_per_halon = min(adjacent_diffs)
-            
+        if t_sec is None or course_type not in r_c or r_cond not in ['良', '稍']:
+            continue
+
+        m = re.search(r'(\d{3,4})', r_c)
+        if not m:
+            continue
+        dist = int(m.group(1))
+
+        single_pci = calc_single_pci(r_c, r.get('time', ''), r.get('up', ''))
+        slow_pace_allowance = 0.0
+        if single_pci is not None and single_pci >= 51.5:
+            slow_pace_allowance = min(1.2, (single_pci - 51.0) * 0.22)
+
+        effective_t_sec = t_sec - slow_pace_allowance
+
+        if dist == current_distance:
+            diff_h = (effective_t_sec - expected_standard_time) / cur_halons
+            same_dist_diffs.append(diff_h)
+        elif 0 < abs(dist - current_distance) <= 400:
+            adj_stats = course_history_db.get(r_c, {})
+            adj_std = adj_stats.get('standard_time')
+            if adj_std is not None:
+                adj_diff = (effective_t_sec - float(adj_std)) / (dist / 200.0)
+            else:
+                halon_gap = (current_distance - dist) / 200.0
+                pace_penalty = halon_gap * 0.45 if halon_gap > 0 else halon_gap * 0.35
+                projected_time = (effective_t_sec * (current_distance / dist)) + pace_penalty
+                adj_diff = (projected_time - expected_standard_time) / cur_halons
+            adjacent_diffs.append(adj_diff)
+
+    if same_dist_diffs:
+        best_diff_per_halon = min(same_dist_diffs)
+    elif adjacent_diffs:
+        best_diff_per_halon = min(adjacent_diffs)
+
     if best_diff_per_halon is None:
         return 1.00 
 
-    mult = 1.00
     is_high_speed = (cushion_val >= 9.5)
-    
-    if best_diff_per_halon <= 0.05:
-        mult = 1.00 
-    elif best_diff_per_halon <= 0.10:
-        mult = 0.95 if is_high_speed else 0.98 
-    elif best_diff_per_halon <= 0.15:
-        mult = 0.88 if is_high_speed else 0.94 
-    else:
-        mult = 0.75 if is_high_speed else 0.88 
 
-    return mult
+    if best_diff_per_halon <= -0.02:
+        mult = 1.02 if is_high_speed else 1.01
+    elif best_diff_per_halon <= 0.06:
+        mult = 1.00 
+    elif best_diff_per_halon <= 0.11:
+        mult = 0.97 if is_high_speed else 0.99 
+    elif best_diff_per_halon <= 0.16:
+        mult = 0.94 if is_high_speed else 0.97 
+    else:
+        mult = 0.92 if is_high_speed else 0.95 
+
+    if total_runs <= 4 or has_sharp_agari:
+        mult = max(mult, 0.97)
+
+    return round(mult, 3)
 
 
 def calculate_stage1_pure_score(
@@ -2793,7 +2777,6 @@ def calculate_comprehensive_score(
         pass
 
     combined_cond_mult = condition_mult * rotation_mult * training_mult
-    # 戦術補正（包まれリスク・単騎ハナ）・ラップギアボーナス・騎手ボーナスを統合
     total_mult = (
         pace_mult
         * bias_mult
@@ -2816,11 +2799,10 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
     by_stage2 = sorted(horses_data, key=lambda x: (x["shisu"], x["myoumi"]), reverse=True)
     by_stage1 = sorted(horses_data, key=lambda x: x["stage1_shisu"], reverse=True)
 
-    # 1着軸の選定: Stage 2の1位馬と2位馬が僅差（1.2pt未満）で、1位馬に『HIGH_BOX_RISK（多頭数イン包まれ警戒）』があり2位馬がスムーズな場合は2位馬を1着軸に昇格
     axis_horse = None
     candidates = [
         h for h in by_stage2
-        if h.get("time_limit_mult", 1.0) >= 0.94 and h.get("training_rank", "B") != "C"
+        if h.get("time_limit_mult", 1.0) >= 0.96 and h.get("training_rank", "B") != "C"
     ]
     if len(candidates) >= 2:
         top1, top2 = candidates[0], candidates[1]
@@ -2844,7 +2826,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         u = h["umaban"]
         if u == axis_umaban:
             continue
-        if h.get("time_limit_mult", 1.0) <= 0.88 or h.get("condition_mult", 1.0) <= 0.88:
+        if h.get("condition_mult", 1.0) <= 0.88:
             continue
         if h.get("training_rank", "B") == "C":
             continue
@@ -2854,7 +2836,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
     if len(main_2nd_horses) < 2:
         for h in by_stage2:
             u = h["umaban"]
-            if u != axis_umaban and h not in main_2nd_horses and h.get("time_limit_mult", 1.0) > 0.88:
+            if u != axis_umaban and h not in main_2nd_horses and h.get("condition_mult", 1.0) > 0.88:
                 main_2nd_horses.append(h)
                 if len(main_2nd_horses) >= 2:
                     break
@@ -2875,11 +2857,11 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         if is_jiriki_top:
             saver_3rd_horses.append(h)
             h["is_bias_victim_rescued"] = True
-            if t_mult <= 0.94:
+            if t_mult <= 0.95:
                 h["rescue_type"] = "time_warn"
             else:
                 h["rescue_type"] = "bias_victim"
-        elif (h["stage1_rank"] <= 6 or h["stage1_shisu"] >= 53.0) and t_mult >= 0.95:
+        elif (h["stage1_rank"] <= 6 or h["stage1_shisu"] >= 53.0) and t_mult >= 0.94:
             saver_3rd_horses.append(h)
             h["is_bias_victim_rescued"] = True
             h["rescue_type"] = "bias_victim"
@@ -2887,7 +2869,6 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         if len(saver_3rd_horses) >= 3:
             break
 
-    # 瞬発ギア◎や妙味上位の一芸穴馬も3列目に確実にすくい上げる
     for h in by_stage2:
         u = h["umaban"]
         if u == axis_umaban or u in main_2nd_umabans:
@@ -2895,8 +2876,8 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         has_gear = bool(h.get("lap_gear_label"))
         if (
             h not in saver_3rd_horses
-            and (h["shisu"] >= 53.0 or h["myoumi"] >= 58.0 or (has_gear and h["shisu"] >= 50.5))
-            and h.get("time_limit_mult", 1.0) >= 0.95
+            and (h["shisu"] >= 52.5 or h["myoumi"] >= 57.5 or (has_gear and h["shisu"] >= 50.0))
+            and h.get("condition_mult", 1.0) > 0.88
             and len(saver_3rd_horses) < 5
         ):
             h["rescue_type"] = "stage2_next"
@@ -2904,6 +2885,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
 
     saver_3rd_umabans = [h["umaban"] for h in saver_3rd_horses]
 
+    # ★改善: 持ち時計不足単独での完全消しを廃止し、「地力下位(Stage1 < 49.0) × 時計不足 × ギアなし × 低妙味」の複合条件のみ完全消しにする
     eliminated_umabans = set()
     for h in by_stage2:
         u = h["umaban"]
@@ -2911,10 +2893,12 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
             continue
         t_mult = h.get("time_limit_mult", 1.0)
         c_mult = h.get("condition_mult", 1.0)
-        if t_mult <= 0.88:
+        has_gear = bool(h.get("lap_gear_label"))
+
+        if t_mult <= 0.93 and h["stage1_shisu"] < 49.0 and not has_gear and h["myoumi"] < 55.0:
             eliminated_umabans.add(u)
             h["role_code"] = "ELIMINATED"
-            h["role_label"] = "💀 完全消し (持ち時計不足)"
+            h["role_label"] = "💀 完全消し (地力下位×時計不足)"
         elif c_mult <= 0.88:
             eliminated_umabans.add(u)
             h["role_code"] = "ELIMINATED"
@@ -2924,7 +2908,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         u = h["umaban"]
         is_jiriki_top = (h["stage1_rank"] <= 4) or (h["stage1_shisu"] >= 55.0)
         t_mult = h.get("time_limit_mult", 1.0)
-        h["is_jiriki_time_warn"] = bool(is_jiriki_top and t_mult <= 0.94)
+        h["is_jiriki_time_warn"] = bool(is_jiriki_top and t_mult <= 0.95)
         box_risk = h.get("box_in_risk_level", "NONE")
 
         if u == axis_umaban:
@@ -3171,7 +3155,6 @@ def diagnose_race(request: RaceRequest):
     for idx, item in enumerate(by_s1):
         item["stage1_rank"] = idx + 1
 
-    # Stage 1の1位馬と2位馬の指数差（圧倒的1強かどうかの判定用）
     stage1_gap_to_2nd = (
         round(by_s1[0]["stage1_shisu"] - by_s1[1]["stage1_shisu"], 1)
         if len(by_s1) >= 2
@@ -3181,7 +3164,6 @@ def diagnose_race(request: RaceRequest):
     for item in temp_items:
         horse = item["horse"]
 
-        # 包まれリスク（1強保護付き）＆ テン3Fハナ争い判定
         tactical_mult, tactical_badges, box_risk_level = evaluate_box_in_and_lead_risk(
             horse, item["stage1_rank"], stage1_gap_to_2nd,
             total_horses_cnt, all_horses_early_info,
@@ -3200,7 +3182,6 @@ def diagnose_race(request: RaceRequest):
             jockey_mult=item["jockey_mult"]
         )
 
-        # 既存のフロントエンド画面でも即座に印が見えるようにラベルを統合しつつ、専用配列でも返す
         all_badges: List[str] = list(tactical_badges)
         if item["gear_label"]:
             all_badges.append(item["gear_label"])
