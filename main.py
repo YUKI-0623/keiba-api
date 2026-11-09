@@ -6,17 +6,14 @@ import lightgbm as lgb
 import pandas as pd
 import numpy as np
 import requests
-from io import StringIO
-from urllib.parse import quote
 import re
 import time
-import random
 import pickle
 import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (完成度90%仕様: 持ち時計スロー補正・包まれリスク印・1強保護版)")
+app = FastAPI(title="競馬シミュレーションAPI (高速・軽量化＆タイムアウト防止完全版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,8 +34,11 @@ with open('horse_history_db.pkl', 'rb') as f:
 with open('course_history_db.pkl', 'rb') as f:
     course_history_db = pickle.load(f)
 
+# ランタイムキャッシュ（同一ページへの重複通信や再取得時のアクセス制限を防止）
 runtime_enriched_db: Dict[str, List[Dict[str, Any]]] = {}
 runtime_pedigree_db: Dict[str, Dict[str, str]] = {}
+html_response_cache: Dict[str, str] = {}
+http_session = requests.Session()
 
 SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "キタサンブラック": {"stamina": 3.0, "heavy": 2.5, "lonspa": 2.0},
@@ -164,6 +164,30 @@ JOCKEY_STAGE_BONUSES: Dict[str, Dict[str, float]] = {
     "菊沢": {"front_keep": 1.012, "outer_smooth": 1.012},
     "菊沢一樹": {"front_keep": 1.012, "outer_smooth": 1.012},
 }
+
+
+def cached_get_html(url: str, headers: dict, timeout: float = 3.5, use_cache: bool = True) -> Optional[str]:
+    """
+    高速・軽量化用のHTTP取得ラッパー（重複リクエストを防止し、短いタイムアウトで即座に切り上げる）
+    """
+    if use_cache and url in html_response_cache:
+        return html_response_cache[url]
+    try:
+        time.sleep(0.08)
+        res = http_session.get(url, headers=headers, timeout=timeout)
+        if res.status_code != 200:
+            return None
+        if "euc-jp" in res.text[:400].lower():
+            res.encoding = "euc-jp"
+        else:
+            res.encoding = res.apparent_encoding
+        text = res.text
+        if use_cache and len(html_response_cache) < 120:
+            html_response_cache[url] = text
+        return text
+    except Exception:
+        return None
+
 
 def safe_encode(encoder_name, value):
     if encoder_name not in encoders:
@@ -407,7 +431,10 @@ def evaluate_lap_gear_aptitude(
 
 
 def evaluate_box_in_and_lead_risk(
-    horse: Any,
+    wakuban_val: float,
+    umaban_val: float,
+    kyakushitsu_val: float,
+    odds_val: float,
     stage1_rank: int,
     stage1_gap_to_2nd: float,
     total_horses: int,
@@ -416,10 +443,10 @@ def evaluate_box_in_and_lead_risk(
     distance: int,
     cushion_val: float
 ) -> tuple[float, List[str], str]:
-    waku = int(round(float(horse.wakuban)))
-    umaban = int(round(float(horse.umaban)))
-    kyaku = int(round(float(horse.kyakushitsu)))
-    odds = float(horse.odds) if horse.odds else 10.0
+    waku = int(round(float(wakuban_val)))
+    umaban = int(round(float(umaban_val)))
+    kyaku = int(round(float(kyakushitsu_val)))
+    odds = float(odds_val) if odds_val else 10.0
 
     is_dominant_lone_leader = (stage1_rank == 1 and stage1_gap_to_2nd >= 3.0)
 
@@ -665,7 +692,7 @@ def parse_race_result_benchmark_from_html(
     expected_race_name: Optional[str] = None,
     strict_validation: bool = False
 ) -> Optional[Dict[str, Any]]:
-    if "HorseList" not in html_text and "race_table_01" not in html_text:
+    if not html_text or ("HorseList" not in html_text and "race_table_01" not in html_text):
         return None
 
     cand_clean_title, cand_course_type, cand_distance = extract_html_race_metadata(html_text)
@@ -786,169 +813,88 @@ def parse_race_result_benchmark_from_html(
     }
 
 
-def find_prev_year_race_ids_by_name_and_data_page(
-    race_id: str,
-    target_year: int,
-    race_name: str,
-    course_type: str,
-    distance: int,
-    headers: dict
-) -> List[str]:
-    candidate_ids: List[str] = []
-    target_clean = normalize_race_title(race_name)
-
-    for data_page in ["data_list.html", "data_top.html"]:
-        try:
-            time.sleep(0.15)
-            d_url = f"https://race.netkeiba.com/race/{data_page}?race_id={race_id}"
-            res_d = requests.get(d_url, headers=headers, timeout=5)
-            if res_d.status_code == 200:
-                res_d.encoding = res_d.apparent_encoding
-                found_ids = re.findall(rf'\b({target_year}\d{{8}})\b', res_d.text)
-                for fid in found_ids:
-                    if fid not in candidate_ids:
-                        candidate_ids.append(fid)
-                if candidate_ids:
-                    break
-        except:
-            continue
-
-    if not is_generic_class_race_name(target_clean) and len(target_clean) >= 2:
-        search_keyword = re.sub(r'\(.*?\)', '', target_clean).strip()
-        if len(search_keyword) < 2:
-            search_keyword = target_clean
-
-        try:
-            euc_word = quote(search_keyword.encode('euc-jp', errors='ignore'))
-            search_urls = [
-                f"https://db.netkeiba.com/?pid=race_list&word={euc_word}",
-                f"https://db.sp.netkeiba.com/?pid=race_list&word={euc_word}"
-            ]
-            for s_url in search_urls:
-                try:
-                    time.sleep(0.15)
-                    res_s = requests.get(s_url, headers=headers, timeout=6)
-                    if res_s.status_code != 200:
-                        continue
-                    res_s.encoding = 'euc-jp' if 'euc-jp' in res_s.text.lower() else res_s.apparent_encoding
-                    s_html = res_s.text
-
-                    tr_blocks = re.findall(r'<tr[^>]*>(.*?)</tr>', s_html, re.DOTALL | re.IGNORECASE)
-                    for tr in tr_blocks:
-                        m_id = re.search(rf'/race/({target_year}\d{{8}})/?', tr)
-                        if not m_id:
-                            continue
-                        cand_id = m_id.group(1)
-                        tr_clean = re.sub(r'<[^>]*>', ' ', tr)
-                        tr_clean = re.sub(r'\s+', ' ', tr_clean).strip()
-
-                        if "天皇賞" in target_clean:
-                            if "春" in target_clean and ("秋" in tr_clean or "2000" in tr_clean):
-                                continue
-                            if "秋" in target_clean and ("春" in tr_clean or "3200" in tr_clean):
-                                continue
-
-                        m_dist = re.search(r'(芝|ダ|障)\s*(\d{3,4})', tr_clean)
-                        if m_dist:
-                            if m_dist.group(1) != course_type:
-                                continue
-                            if abs(int(m_dist.group(2)) - distance) > 400:
-                                continue
-
-                        if cand_id not in candidate_ids:
-                            candidate_ids.append(cand_id)
-
-                    if candidate_ids:
-                        break
-                except:
-                    continue
-        except:
-            pass
-
-    return candidate_ids
-
-
 def fetch_reference_race_benchmarks(
     race_id: str,
     headers: dict,
     c_stats: dict,
     course_type: str,
     distance: int,
-    race_name: str = ""
+    race_name: str = "",
+    start_ts: float = 0.0
 ) -> Dict[str, Any]:
+    """
+    高速・軽量版の前年＆今年度ベンチマーク取得（重いdb.netkeiba.com検索を廃止し、race.netkeiba.comのキャッシュとdata_listのみを使用）
+    """
     current_year_bench = None
     prev_year_bench = None
 
-    try:
-        res_cur = requests.get(
-            f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
-            headers=headers, timeout=6
+    # 1. 今年度結果（すでにオッズ取得でキャッシュされていれば通信0秒で即取得）
+    cur_html = cached_get_html(
+        f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
+        headers, timeout=3.0
+    )
+    if cur_html:
+        current_year_bench = parse_race_result_benchmark_from_html(
+            cur_html,
+            f"今年度確定 ({race_id[:4]}年)",
+            expected_course_type=course_type,
+            expected_distance=distance,
+            expected_race_name=race_name,
+            strict_validation=False
         )
-        if res_cur.status_code == 200:
-            res_cur.encoding = res_cur.apparent_encoding
-            current_year_bench = parse_race_result_benchmark_from_html(
-                res_cur.text,
-                f"今年度確定 ({race_id[:4]}年)",
-                expected_course_type=course_type,
-                expected_distance=distance,
-                expected_race_name=race_name,
-                strict_validation=False
-            )
-    except:
-        pass
 
-    if len(race_id) == 12 and race_id.isdigit():
+    # 2. 前年度（同レース）の高速特定（最大3〜4回の軽量通信のみ）
+    if len(race_id) == 12 and race_id.isdigit() and (start_ts == 0.0 or (time.time() - start_ts) < 7.0):
         prev_year = int(race_id[:4]) - 1
         place_code = race_id[4:6]
         kai_num = int(race_id[6:8])
         day_num = int(race_id[8:10])
         r_num = int(race_id[10:12])
 
-        search_ids = find_prev_year_race_ids_by_name_and_data_page(
-            race_id, prev_year, race_name, course_type, distance, headers
-        )
+        cand_ids: List[str] = []
 
+        # (A) data_list.html 1ページだけから過去同レースのIDを高速抽出
+        data_html = cached_get_html(
+            f"https://race.netkeiba.com/race/data_list.html?race_id={race_id}",
+            headers, timeout=2.5
+        )
+        if data_html:
+            for fid in re.findall(rf'\b({prev_year}\d{{8}})\b', data_html):
+                if fid not in cand_ids:
+                    cand_ids.append(fid)
+
+        # (B) 直接の前年IDと開催回±1のID（例: 2025年天皇賞・春の 3回京都4日11R -> 2回京都4日11R）
         direct_prev_id = f"{prev_year}{race_id[4:]}"
-        if direct_prev_id not in search_ids:
-            search_ids.append(direct_prev_id)
+        if direct_prev_id not in cand_ids:
+            cand_ids.append(direct_prev_id)
 
         for k_diff in [-1, 1]:
             adj_kai = kai_num + k_diff
             if 1 <= adj_kai <= 6:
                 adj_id = f"{prev_year}{place_code}{adj_kai:02d}{day_num:02d}{r_num:02d}"
-                if adj_id not in search_ids:
-                    search_ids.append(adj_id)
+                if adj_id not in cand_ids:
+                    cand_ids.append(adj_id)
 
-        for cand_prev_id in search_ids[:6]:
-            prev_urls = [
-                f"https://db.netkeiba.com/race/{cand_prev_id}/",
-                f"https://race.netkeiba.com/race/result.html?race_id={cand_prev_id}"
-            ]
-            for p_url in prev_urls:
-                try:
-                    time.sleep(0.15)
-                    res_prev = requests.get(p_url, headers=headers, timeout=6)
-                    if res_prev.status_code == 200:
-                        if "db.netkeiba.com" in p_url:
-                            res_prev.encoding = 'euc-jp' if 'euc-jp' in res_prev.text.lower() else res_prev.apparent_encoding
-                        else:
-                            res_prev.encoding = res_prev.apparent_encoding
-
-                        parsed_p = parse_race_result_benchmark_from_html(
-                            res_prev.text,
-                            f"前年実績 ({prev_year}年)",
-                            expected_course_type=course_type,
-                            expected_distance=distance,
-                            expected_race_name=race_name,
-                            strict_validation=True
-                        )
-                        if parsed_p:
-                            prev_year_bench = parsed_p
-                            break
-                except:
-                    continue
-            if prev_year_bench:
+        # 最大3件まで高速な race.netkeiba.com/race/result.html で照合
+        for cid in cand_ids[:3]:
+            if start_ts > 0.0 and (time.time() - start_ts) > 7.5:
                 break
+            p_html = cached_get_html(
+                f"https://race.netkeiba.com/race/result.html?race_id={cid}",
+                headers, timeout=2.5
+            )
+            if p_html:
+                parsed_p = parse_race_result_benchmark_from_html(
+                    p_html,
+                    f"前年実績 ({prev_year}年)",
+                    expected_course_type=course_type,
+                    expected_distance=distance,
+                    expected_race_name=race_name,
+                    strict_validation=True
+                )
+                if parsed_p:
+                    prev_year_bench = parsed_p
+                    break
 
     std_sec = get_expected_standard_time(c_stats, course_type, distance)
     std_time_str = format_seconds_to_time_str(std_sec)
@@ -1042,15 +988,9 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
             runtime_pedigree_db[bamei] = copy.deepcopy(KNOWN_HORSE_PEDIGREE[bamei])
 
     try:
-        time.sleep(0.25)
         url = f"https://race.netkeiba.com/race/shutuba_past.html?race_id={race_id}"
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code != 200:
-            return False, 0
-        res.encoding = res.apparent_encoding
-        past_html = res.text
-
-        if "Past" not in past_html and "HorseList" not in past_html:
+        past_html = cached_get_html(url, headers, timeout=4.5)
+        if not past_html or ("Past" not in past_html and "HorseList" not in past_html):
             return False, 0
 
         rows = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', past_html, re.DOTALL | re.IGNORECASE)
@@ -1599,7 +1539,7 @@ def parse_finished_race_html_odds(
     odds_map: Dict[int, float] = {}
     weight_map: Dict[int, tuple[float, float]] = {}
 
-    if "HorseList" not in result_html:
+    if not result_html or "HorseList" not in result_html:
         return odds_map, weight_map
 
     if "Result_Num" not in result_html and "Pay_Table" not in result_html and "All_Result_Table" not in result_html:
@@ -1694,83 +1634,43 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
         'Accept': 'application/json, text/javascript, */*; q=0.01'
     }
 
-    api_urls = [
-        f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=init&sort=odds&compress=0&output=json",
-        f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=update&compress=0&output=json",
-        f"https://race.netkeiba.com/api/api_get_jra_odds.html?race_id={race_id}&type=1&action=init&compress=0&output=json"
-    ]
-
+    url = f"https://race.netkeiba.com/api/api_get_jra_odds.html?pid=api_get_jra_odds&race_id={race_id}&type=1&action=init&sort=odds&compress=0&output=json"
     api_status_str = ""
-    for url in api_urls:
-        try:
-            time.sleep(0.2)
-            resp = requests.get(url, headers=js_headers, timeout=6)
-            if resp.status_code != 200:
-                continue
+    try:
+        time.sleep(0.08)
+        resp = http_session.get(url, headers=js_headers, timeout=3.5)
+        if resp.status_code == 200:
             payload = resp.json()
-            if not isinstance(payload, dict):
-                continue
-
-            status_val = str(payload.get("status", "")).lower()
-            data_obj = payload.get("data")
-            if not isinstance(data_obj, dict):
-                continue
-
-            odds_root = data_obj.get("odds")
-            if not isinstance(odds_root, dict):
-                continue
-
-            tan_dict = odds_root.get("1")
-            if not isinstance(tan_dict, dict):
-                continue
-
-            temp_map: Dict[int, float] = {}
-            for k_umaban, v_arr in tan_dict.items():
-                try:
-                    u_num = int(str(k_umaban).strip())
-                    raw_o = v_arr[0] if isinstance(v_arr, (list, tuple)) and len(v_arr) > 0 else v_arr
-                    o_str = str(raw_o).strip().replace(',', '')
-                    if o_str and o_str not in ['---.-', '--.-', '-', '']:
-                        o_val = float(o_str)
-                        if 1.0 <= o_val <= 9999.9:
-                            temp_map[u_num] = o_val
-                except:
-                    continue
-
-            if len(temp_map) >= 2:
-                odds_map = temp_map
-                api_status_str = status_val
-                break
-        except:
-            continue
+            if isinstance(payload, dict):
+                status_val = str(payload.get("status", "")).lower()
+                data_obj = payload.get("data")
+                if isinstance(data_obj, dict):
+                    odds_root = data_obj.get("odds")
+                    if isinstance(odds_root, dict):
+                        tan_dict = odds_root.get("1")
+                        if isinstance(tan_dict, dict):
+                            temp_map: Dict[int, float] = {}
+                            for k_umaban, v_arr in tan_dict.items():
+                                try:
+                                    u_num = int(str(k_umaban).strip())
+                                    raw_o = v_arr[0] if isinstance(v_arr, (list, tuple)) and len(v_arr) > 0 else v_arr
+                                    o_str = str(raw_o).strip().replace(',', '')
+                                    if o_str and o_str not in ['---.-', '--.-', '-', '']:
+                                        o_val = float(o_str)
+                                        if 1.0 <= o_val <= 9999.9:
+                                            temp_map[u_num] = o_val
+                                except:
+                                    continue
+                            if len(temp_map) >= 2:
+                                odds_map = temp_map
+                                api_status_str = status_val
+    except:
+        pass
 
     if len(odds_map) >= 2:
         if api_status_str == "yoso":
             return odds_map, "js_yoso"
         return odds_map, "js_realtime"
-
-    try:
-        time.sleep(0.2)
-        sp_url = f"https://race.sp.netkeiba.com/?pid=odds_view&type=b1&race_id={race_id}"
-        sp_res = requests.get(sp_url, headers=headers, timeout=6)
-        if sp_res.status_code == 200:
-            sp_res.encoding = sp_res.apparent_encoding
-            sp_map: Dict[int, float] = {}
-            tr_blocks = re.findall(r'<tr[^>]*>(.*?)</tr>', sp_res.text, re.DOTALL | re.IGNORECASE)
-            for tr in tr_blocks:
-                tds = re.findall(r'<td[^>]*>(.*?)</td>', tr, re.DOTALL | re.IGNORECASE)
-                if len(tds) >= 4:
-                    u_cand = re.sub(r'<[^>]*>', '', tds[1]).strip()
-                    o_cand = re.sub(r'<[^>]*>', '', tds[-1]).strip().replace(',', '')
-                    if u_cand.isdigit() and re.match(r'^\d+\.\d+$', o_cand):
-                        u_i = int(u_cand)
-                        o_f = float(o_cand)
-                        if 1 <= u_i <= 18 and 1.0 <= o_f <= 9999.9:
-                            sp_map[u_i] = o_f
-            if len(sp_map) >= 2:
-                return sp_map, "js_realtime"
-    except:
-        pass
 
     return {}, "none"
 
@@ -1778,49 +1678,19 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
 def fetch_hybrid_odds_and_result_weights(
     race_id: str, shutuba_html: str, headers: dict, bamei_to_umaban: Optional[Dict[str, int]] = None
 ) -> tuple[Dict[int, float], Dict[int, tuple[float, float]], str, str]:
-    try:
-        time.sleep(0.2)
-        res_result = requests.get(
-            f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
-            headers=headers, timeout=8
-        )
-        if res_result.status_code == 200:
-            res_result.encoding = res_result.apparent_encoding
-            html_odds, html_weights = parse_finished_race_html_odds(res_result.text, bamei_to_umaban)
-            if len(html_odds) >= 2:
-                return (
-                    html_odds,
-                    html_weights,
-                    "html_result",
-                    f"✅ オッズ自動取得 [終了レース・HTML形式]: レース結果HTMLから確定単勝オッズ（{len(html_odds)}頭）を正確に反映しました。"
-                )
-    except:
-        pass
-
-    try:
-        if len(race_id) == 12 and int(race_id[:4]) < datetime.now().year:
-            time.sleep(0.2)
-            res_db = requests.get(f"https://db.netkeiba.com/race/{race_id}/", headers=headers, timeout=8)
-            if res_db.status_code == 200:
-                res_db.encoding = res_db.apparent_encoding
-                db_odds: Dict[int, float] = {}
-                rows = re.findall(r'<tr[^>]*>(.*?)</tr>', res_db.text, re.DOTALL | re.IGNORECASE)
-                for r_html in rows:
-                    tds = re.findall(r'<td[^>]*>(.*?)</td>', r_html, re.DOTALL | re.IGNORECASE)
-                    if len(tds) >= 13:
-                        u_s = re.sub(r'<[^>]*>', '', tds[2]).strip()
-                        o_s = re.sub(r'<[^>]*>', '', tds[12]).strip().replace(',', '')
-                        if u_s.isdigit() and re.match(r'^\d+\.\d+$', o_s):
-                            db_odds[int(u_s)] = float(o_s)
-                if len(db_odds) >= 2:
-                    return (
-                        db_odds,
-                        {},
-                        "html_db",
-                        f"✅ オッズ自動取得 [過去DB・HTML形式]: 過去データベースHTMLから確定単勝オッズ（{len(db_odds)}頭）を反映しました。"
-                    )
-    except:
-        pass
+    res_html = cached_get_html(
+        f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
+        headers, timeout=3.5
+    )
+    if res_html:
+        html_odds, html_weights = parse_finished_race_html_odds(res_html, bamei_to_umaban)
+        if len(html_odds) >= 2:
+            return (
+                html_odds,
+                html_weights,
+                "html_result",
+                f"✅ オッズ自動取得 [終了レース・HTML形式]: レース結果HTMLから確定単勝オッズ（{len(html_odds)}頭）を正確に反映しました。"
+            )
 
     js_odds, js_mode = fetch_future_race_js_odds(race_id, headers)
     if len(js_odds) >= 2:
@@ -1963,7 +1833,7 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
 
 
 def parse_single_race_result_for_bias(res_html: str, target_track_type: str) -> Optional[List[Dict[str, int]]]:
-    if "HorseList" not in res_html:
+    if not res_html or "HorseList" not in res_html:
         return None
     if "Result_Num" not in res_html and "PassageRate" not in res_html and "All_Result_Table" not in res_html:
         return None
@@ -2029,8 +1899,11 @@ def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]
 
 
 def auto_detect_track_bias(
-    race_id: str, target_track_type: str, shutuba_html: str, rail_code: str = "", rail_msg: str = ""
+    race_id: str, target_track_type: str, shutuba_html: str, rail_code: str = "", rail_msg: str = "", start_ts: float = 0.0
 ) -> tuple[str, str, str, str]:
+    """
+    高速・軽量版バイアス判定: 最大3レースまでの短時間チェックに制限し、全体経過時間が8秒を超えたら即スキップする
+    """
     try:
         if len(race_id) < 12 or not race_id.isdigit():
             return "フラット", "中", "manual_required", "⚠️ レースID形式から過去レースを参照できないため、トラックバイアスは手動で設定してください。"
@@ -2038,6 +1911,10 @@ def auto_detect_track_bias(
         prefix_8 = race_id[:8]
         day_num = int(race_id[8:10])
         race_num = int(race_id[10:12])
+        rail_suffix = f" （{rail_msg}）" if rail_msg else ""
+
+        if start_ts > 0.0 and (time.time() - start_ts) > 8.0:
+            return "フラット", "中", "manual_required", f"ℹ️ 高速レスポンス優先のためバイアス手動設定モードにしました。{rail_suffix}"
 
         weekday = detect_target_race_weekday(shutuba_html, day_num)
         is_saturday_race = (weekday == 5) or (day_num == 1)
@@ -2047,75 +1924,56 @@ def auto_detect_track_bias(
         sampled_same_day = 0
         sampled_prev_day = 0
 
-        same_day_has_results = False
+        # 当日の直近レースを最大3鞍まで高速チェック
         if race_num >= 2:
-            r1_id = f"{prefix_8}{day_num:02d}01"
-            try:
-                time.sleep(0.2)
-                r1_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={r1_id}", headers=headers, timeout=4)
-                if r1_res.status_code == 200:
-                    r1_res.encoding = r1_res.apparent_encoding
-                    parsed_r1 = parse_single_race_result_for_bias(r1_res.text, target_track_type)
-                    if parsed_r1 is not None:
-                        same_day_has_results = True
-                        for r_no in range(race_num - 1, 1, -1):
-                            if sampled_same_day >= 5:
-                                break
-                            cid = f"{prefix_8}{day_num:02d}{r_no:02d}"
-                            try:
-                                time.sleep(0.2)
-                                r_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers=headers, timeout=4)
-                                if r_res.status_code == 200:
-                                    r_res.encoding = r_res.apparent_encoding
-                                    parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
-                                    if parsed:
-                                        collected_top3.extend(parsed)
-                                        sampled_same_day += 1
-                            except:
-                                continue
-                        if parsed_r1 and sampled_same_day < 5:
-                            collected_top3.extend(parsed_r1)
-                            sampled_same_day += 1
-            except:
-                pass
+            checked_cnt = 0
+            for r_no in range(race_num - 1, 0, -1):
+                if sampled_same_day >= 3 or checked_cnt >= 4:
+                    break
+                if start_ts > 0.0 and (time.time() - start_ts) > 8.5:
+                    break
+                checked_cnt += 1
+                cid = f"{prefix_8}{day_num:02d}{r_no:02d}"
+                r_html = cached_get_html(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers, timeout=2.2)
+                if r_html is None:
+                    break
+                parsed = parse_single_race_result_for_bias(r_html, target_track_type)
+                if parsed is None and r_no == race_num - 1:
+                    break
+                if parsed:
+                    collected_top3.extend(parsed)
+                    sampled_same_day += 1
 
-        if sampled_same_day < 2 and day_num >= 2 and not is_saturday_race:
+        # 当日結果がまだない日曜・月曜の場合、前日のメイン付近（9R〜12R）から最大3鞍だけチェック
+        if sampled_same_day == 0 and day_num >= 2 and not is_saturday_race:
             prev_day = day_num - 1
-            for r_no in range(12, 0, -1):
-                if (sampled_same_day + sampled_prev_day) >= 5:
+            for r_no in [12, 11, 10, 9]:
+                if sampled_prev_day >= 3:
+                    break
+                if start_ts > 0.0 and (time.time() - start_ts) > 8.5:
                     break
                 cid = f"{prefix_8}{prev_day:02d}{r_no:02d}"
-                try:
-                    time.sleep(0.2)
-                    r_res = requests.get(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers=headers, timeout=4)
-                    if r_res.status_code == 200:
-                        r_res.encoding = r_res.apparent_encoding
-                        parsed = parse_single_race_result_for_bias(r_res.text, target_track_type)
-                        if parsed is None and r_no == 11 and sampled_prev_day == 0:
-                            break
-                        if parsed:
-                            collected_top3.extend(parsed)
-                            sampled_prev_day += 1
-                except:
-                    continue
+                r_html = cached_get_html(f"https://race.netkeiba.com/race/result.html?race_id={cid}", headers, timeout=2.2)
+                if not r_html:
+                    break
+                parsed = parse_single_race_result_for_bias(r_html, target_track_type)
+                if parsed is None and r_no == 12:
+                    break
+                if parsed:
+                    collected_top3.extend(parsed)
+                    sampled_prev_day += 1
 
         total_sampled_races = sampled_same_day + sampled_prev_day
-        rail_suffix = f" （{rail_msg}）" if rail_msg else ""
 
-        if total_sampled_races < 2 or len(collected_top3) < 4:
+        if total_sampled_races < 1 or len(collected_top3) < 3:
             if target_track_type == "芝" and day_num <= 2 and rail_code in ["A", "B"]:
                 return (
                     "イン前有利 (1〜4枠・先行)", "弱", "auto_detected",
                     f"✅ バイアス自動推定 [開催{day_num}日目・{rail_code}コース開幕週]: 芝保護状態につき『イン前有利（強度:弱）』を初期セットしました。{rail_suffix}"
                 )
-            if is_saturday_race and not same_day_has_results:
-                return (
-                    "フラット", "中", "manual_required",
-                    f"⚠️ 土曜開催のレース開始前（前日金曜のレースなし）のため、トラックバイアスは手動で設定してください。{rail_suffix}"
-                )
             return (
                 "フラット", "中", "manual_required",
-                f"⚠️ 参照できる当日・前日の同コース確定レース結果がまだありません。トラックバイアスは手動で設定してください。{rail_suffix}"
+                f"⚠️ 参照できる当日・前日の同コース確定結果がまだないため、トラックバイアスは手動で設定してください。{rail_suffix}"
             )
 
         total_horses = len(collected_top3)
@@ -2159,13 +2017,7 @@ def auto_detect_track_bias(
             detected_bias = "外枠有利"
             detected_strength = "極端" if outer_rate >= 0.75 else "中"
 
-        if sampled_same_day >= 2 and sampled_prev_day == 0:
-            source_label = f"当日({day_num}日目)の最新同コース結果 {sampled_same_day}鞍"
-        elif sampled_same_day == 0 and sampled_prev_day >= 2:
-            source_label = f"前日・土曜({day_num - 1}日目)の同コース確定結果 {sampled_prev_day}鞍"
-        else:
-            source_label = f"当日{sampled_same_day}鞍＋前日{sampled_prev_day}鞍の同コース結果"
-
+        source_label = f"当日{sampled_same_day}鞍" if sampled_same_day > 0 else f"前日{sampled_prev_day}鞍"
         summary_msg = (
             f"✅ バイアス自動判定 [{source_label} / 上位{total_horses}頭集計]："
             f"内枠率{int(inner_rate*100)}%・4角4番手以内率{int(front_rate*100)}% ➔ "
@@ -2213,27 +2065,36 @@ class RaceRequest(BaseModel):
     bias_strength: str = "中" 
     cushion_value: float = 9.5 
 
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "Keiba Simulator API is running."}
+
+
 @app.get("/fetch_race/{race_id}")
 def fetch_race(race_id: str):
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    start_ts = time.time()
+    clean_race_id = re.sub(r'\D', '', str(race_id or ""))
+    if not clean_race_id:
+        return {"status": "error", "message": "有効なレースID（半角数字12桁）を入力してください"}
+
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     html = None
     is_shutuba = False
     
-    for attempt in range(3):
-        time.sleep(random.uniform(1.0, 2.0)) 
-        try:
-            res = requests.get(f"https://race.netkeiba.com/race/shutuba.html?race_id={race_id}", headers=headers, timeout=15)
-            res.raise_for_status()
-            res.encoding = res.apparent_encoding
-            html = res.text
-            if "HorseList" in html or "馬番" in html:
-                is_shutuba = True
-                break
-        except:
-            if attempt == 2: return {"status": "error", "message": "通信エラー"}
+    for attempt in range(2):
+        html_cand = cached_get_html(
+            f"https://race.netkeiba.com/race/shutuba.html?race_id={clean_race_id}",
+            headers, timeout=6.0, use_cache=(attempt == 0)
+        )
+        if html_cand and ("HorseList" in html_cand or "馬番" in html_cand):
+            html = html_cand
+            is_shutuba = True
+            break
+        time.sleep(0.3)
 
-    if not is_shutuba:
-        return {"status": "error", "message": "出馬表データが見つかりませんでした"}
+    if not is_shutuba or not html:
+        return {"status": "error", "message": "出馬表データが見つかりませんでした。レースIDを確認してください。"}
 
     try:
         title_match = re.search(r'<title>(.*?)</title>', html)
@@ -2241,7 +2102,7 @@ def fetch_race(race_id: str):
         target_race_date = extract_target_race_date(html)
         rail_code, rail_msg = extract_course_rail_info(html)
 
-        place_code = race_id[4:6] if len(race_id) >= 6 else '05'
+        place_code = clean_race_id[4:6] if len(clean_race_id) >= 6 else '05'
         place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
         place_name = place_dict.get(place_code, "地方/海外")
 
@@ -2285,10 +2146,10 @@ def fetch_race(race_id: str):
             except:
                 continue
 
-        past_merged_ok, merged_cnt = fetch_and_merge_shutuba_past(race_id, headers, bamei_list)
+        past_merged_ok, merged_cnt = fetch_and_merge_shutuba_past(clean_race_id, headers, bamei_list)
 
         hybrid_odds_map, result_weight_map, odds_status, odds_msg = fetch_hybrid_odds_and_result_weights(
-            race_id, html, headers, bamei_to_umaban
+            clean_race_id, html, headers, bamei_to_umaban
         )
 
         horses_data = []
@@ -2458,12 +2319,9 @@ def fetch_race(race_id: str):
         p_gap = (by_power[0]["power_score"] - by_power[1]["power_score"]) * 25.0 if len(by_power) >= 2 else 0.0
         for h in horses_data:
             p_rank = next((i + 1 for i, x in enumerate(by_power) if x["umaban"] == h["umaban"]), 99)
-            DummyH = type("DummyH", (), {
-                "wakuban": h["wakuban"], "umaban": h["umaban"],
-                "kyakushitsu": h["kyakushitsu"], "odds": h["odds"]
-            })
             _, preview_badges, _ = evaluate_box_in_and_lead_risk(
-                DummyH, p_rank, p_gap, total_h, early_info_preview, track_type, distance, 9.5
+                h["wakuban"], h["umaban"], h["kyakushitsu"], h["odds"],
+                p_rank, p_gap, total_h, early_info_preview, track_type, distance, 9.5
             )
             if preview_badges:
                 h["condition_reason"] = f"{' '.join(preview_badges)} / {h['condition_reason']}"
@@ -2473,15 +2331,16 @@ def fetch_race(race_id: str):
         rpci, rpci_type, _ = get_course_rpci_stats(course_key)
 
         reference_benchmarks = fetch_reference_race_benchmarks(
-            race_id, headers, c_stats, track_type, distance, race_name=race_name
+            clean_race_id, headers, c_stats, track_type, distance, race_name=race_name, start_ts=start_ts
         )
 
         auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
         auto_bias, auto_strength, bias_status, bias_msg = auto_detect_track_bias(
-            race_id, track_type, html, rail_code=rail_code, rail_msg=rail_msg
+            clean_race_id, track_type, html, rail_code=rail_code, rail_msg=rail_msg, start_ts=start_ts
         )
 
-        db_merge_note = f" [5走柱・ラップギア・包まれ解析:{merged_cnt}頭 / 叩き2走目:{tataki2_count}頭]" if past_merged_ok else " [サーバーDB＋血統辞書使用]"
+        elapsed_sec = round(time.time() - start_ts, 1)
+        db_merge_note = f" [5走柱・ラップギア・包まれ解析:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB＋血統辞書使用 / {elapsed_sec}秒]"
         if any_weight_announced:
             weight_status = "auto_detected"
             weight_msg = f"✅ 馬体重・血統・ローテ・包まれリスク印を自動セットしました。{db_merge_note}"
@@ -2518,12 +2377,6 @@ def fetch_race(race_id: str):
 
 
 def get_time_limit_multiplier(horse_name, course_type, current_distance, expected_standard_time, cushion_val, track_cond):
-    """
-    ★改善版 持ち時計評価:
-    ・スローペース（PCI 51.5以上）での走破時計遅れを最大1.2秒短縮補正して評価
-    ・キャリア4戦以下、または上がり33.9秒以下・上がり2位以内の決め手がある馬は最低でも0.97倍に保護（3着ヒモから消さない）
-    ・優秀な持ち時計には1.02倍（加点ボーナス）、減点下限も0.92倍に緩和
-    """
     is_rough_track = (track_cond in ["稍", "重", "不"]) or (cushion_val < 8.5)
     if is_rough_track or current_distance >= 2500:
         return 1.00 
@@ -2885,7 +2738,6 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
 
     saver_3rd_umabans = [h["umaban"] for h in saver_3rd_horses]
 
-    # ★改善: 持ち時計不足単独での完全消しを廃止し、「地力下位(Stage1 < 49.0) × 時計不足 × ギアなし × 低妙味」の複合条件のみ完全消しにする
     eliminated_umabans = set()
     for h in by_stage2:
         u = h["umaban"]
@@ -3165,7 +3017,8 @@ def diagnose_race(request: RaceRequest):
         horse = item["horse"]
 
         tactical_mult, tactical_badges, box_risk_level = evaluate_box_in_and_lead_risk(
-            horse, item["stage1_rank"], stage1_gap_to_2nd,
+            horse.wakuban, horse.umaban, horse.kyakushitsu, horse.odds,
+            item["stage1_rank"], stage1_gap_to_2nd,
             total_horses_cnt, all_horses_early_info,
             request.course_type, request.distance, request.cushion_value
         )
@@ -3408,7 +3261,8 @@ def simulate_race(request: RaceRequest):
     for item in temp_items:
         horse = item["horse"]
         tactical_mult, _, _ = evaluate_box_in_and_lead_risk(
-            horse, item["stage1_rank"], stage1_gap_to_2nd,
+            horse.wakuban, horse.umaban, horse.kyakushitsu, horse.odds,
+            item["stage1_rank"], stage1_gap_to_2nd,
             total_horses_cnt, all_horses_early_info,
             request.course_type, request.distance, request.cushion_value
         )
