@@ -13,11 +13,11 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (高速・軽量化＆タイムアウト防止完全版)")
+app = FastAPI(title="競馬シミュレーションAPI (全レース・雨道悪・前残り警戒・高速完全版)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,68 +30,67 @@ with open('encoders_pro.pkl', 'rb') as f:
 
 with open('horse_history_db.pkl', 'rb') as f:
     horse_history_db = pickle.load(f)
-    
+
 with open('course_history_db.pkl', 'rb') as f:
     course_history_db = pickle.load(f)
 
-# ランタイムキャッシュ（同一ページへの重複通信や再取得時のアクセス制限を防止）
 runtime_enriched_db: Dict[str, List[Dict[str, Any]]] = {}
 runtime_pedigree_db: Dict[str, Dict[str, str]] = {}
 html_response_cache: Dict[str, str] = {}
 http_session = requests.Session()
 
 SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
-    "キタサンブラック": {"stamina": 3.0, "heavy": 2.5, "lonspa": 2.0},
-    "エピファネイア": {"stamina": 3.0, "heavy": 2.0, "lonspa": 2.0},
+    "キタサンブラック": {"stamina": 3.0, "heavy": 2.8, "lonspa": 2.2},
+    "エピファネイア": {"stamina": 3.0, "heavy": 2.6, "lonspa": 2.2},
     "ワールドプレミア": {"stamina": 3.0, "heavy": 2.5, "lonspa": 2.0},
-    "ゴールドシップ": {"stamina": 3.0, "heavy": 3.0, "lonspa": 2.0},
-    "オルフェーヴル": {"stamina": 3.0, "heavy": 3.0, "lonspa": 2.0},
-    "ハーツクライ": {"stamina": 2.8, "heavy": 1.0, "lonspa": 2.0},
-    "ステイゴールド": {"stamina": 3.0, "heavy": 2.8, "lonspa": 2.0},
-    "フィエールマン": {"stamina": 3.0, "heavy": 1.5, "lonspa": 2.0},
-    "サトノダイヤモンド": {"stamina": 2.8, "heavy": 1.5, "lonspa": 1.8},
-    "シュヴァルグラン": {"stamina": 2.8, "heavy": 2.0, "lonspa": 1.8},
-    "マンハッタンカフェ": {"stamina": 2.8, "heavy": 2.0, "lonspa": 1.8},
-    "スクリーンヒーロー": {"stamina": 2.5, "heavy": 2.5, "lonspa": 1.8},
-    "ダンスインザダーク": {"stamina": 3.0, "heavy": 1.5, "lonspa": 2.0},
-    "トニービン": {"stamina": 2.8, "heavy": 2.0, "lonspa": 2.0},
-    "スワーヴリチャード": {"stamina": 2.4, "heavy": 2.5, "lonspa": 2.0},
-    "キズナ": {"stamina": 2.3, "heavy": 2.5, "lonspa": 1.8},
-    "ドゥラメンテ": {"stamina": 2.4, "heavy": 2.2, "lonspa": 1.8},
-    "コントレイル": {"stamina": 2.2, "heavy": 1.0, "lonspa": 1.8},
-    "ディープインパクト": {"stamina": 2.3, "heavy": 0.5, "lonspa": 2.0},
-    "ブラックタイド": {"stamina": 2.4, "heavy": 2.0, "lonspa": 1.8},
-    "レイデオロ": {"stamina": 2.4, "heavy": 2.0, "lonspa": 1.8},
-    "ルーラーシップ": {"stamina": 2.3, "heavy": 2.6, "lonspa": 1.8},
-    "ハービンジャー": {"stamina": 2.2, "heavy": 2.8, "lonspa": 1.8},
-    "キングカメハメハ": {"stamina": 2.0, "heavy": 2.0, "lonspa": 1.5},
-    "サートゥルナーリア": {"stamina": 1.8, "heavy": 1.5, "lonspa": 1.5},
-    "モーリス": {"stamina": 1.8, "heavy": 2.6, "lonspa": 1.6},
-    "ロベルト": {"stamina": 2.2, "heavy": 2.8, "lonspa": 1.8},
-    "サドラーズウェルズ": {"stamina": 3.0, "heavy": 3.0, "lonspa": 2.0},
-    "Galileo": {"stamina": 3.0, "heavy": 2.8, "lonspa": 2.0},
-    "Montjeu": {"stamina": 3.0, "heavy": 3.0, "lonspa": 2.0},
-    "バゴ": {"stamina": 2.4, "heavy": 3.0, "lonspa": 1.8},
-    "ジャスタウェイ": {"stamina": 1.8, "heavy": 1.5, "lonspa": 1.5},
-    "リアルスティール": {"stamina": 1.8, "heavy": 1.2, "lonspa": 1.5},
-    "シルバーステート": {"stamina": 1.6, "heavy": 2.2, "lonspa": 1.4},
-    "アルアイン": {"stamina": 1.8, "heavy": 2.0, "lonspa": 1.5},
-    "リオンディーズ": {"stamina": 2.0, "heavy": 2.0, "lonspa": 1.5},
-    "ブリックスアンドモルタル": {"stamina": 1.6, "heavy": 1.5, "lonspa": 1.4},
-    "エイシンフラッシュ": {"stamina": 2.0, "heavy": 1.8, "lonspa": 1.5},
-    "ノヴェリスト": {"stamina": 2.4, "heavy": 2.5, "lonspa": 1.6},
-    "シンボリクリスエス": {"stamina": 2.2, "heavy": 2.4, "lonspa": 1.8},
-    "ネオユニヴァース": {"stamina": 2.2, "heavy": 2.5, "lonspa": 1.6},
+    "ゴールドシップ": {"stamina": 3.0, "heavy": 3.2, "lonspa": 2.2},
+    "オルフェーヴル": {"stamina": 3.0, "heavy": 3.2, "lonspa": 2.2},
+    "ハーツクライ": {"stamina": 2.8, "heavy": 1.4, "lonspa": 2.0},
+    "ステイゴールド": {"stamina": 3.0, "heavy": 3.0, "lonspa": 2.0},
+    "フィエールマン": {"stamina": 3.0, "heavy": 1.8, "lonspa": 2.0},
+    "サトノダイヤモンド": {"stamina": 2.8, "heavy": 1.8, "lonspa": 1.8},
+    "シュヴァルグラン": {"stamina": 2.8, "heavy": 2.2, "lonspa": 1.8},
+    "マンハッタンカフェ": {"stamina": 2.8, "heavy": 2.2, "lonspa": 1.8},
+    "スクリーンヒーロー": {"stamina": 2.5, "heavy": 2.8, "lonspa": 1.8},
+    "ダンスインザダーク": {"stamina": 3.0, "heavy": 1.6, "lonspa": 2.0},
+    "トニービン": {"stamina": 2.8, "heavy": 2.4, "lonspa": 2.0},
+    "スワーヴリチャード": {"stamina": 2.4, "heavy": 2.6, "lonspa": 2.0},
+    "キズナ": {"stamina": 2.5, "heavy": 3.0, "lonspa": 2.0},
+    "ドゥラメンテ": {"stamina": 2.4, "heavy": 2.5, "lonspa": 1.9},
+    "コントレイル": {"stamina": 2.2, "heavy": 1.2, "lonspa": 1.8},
+    "ディープインパクト": {"stamina": 2.3, "heavy": 0.6, "lonspa": 2.0},
+    "ブラックタイド": {"stamina": 2.4, "heavy": 2.2, "lonspa": 1.8},
+    "レイデオロ": {"stamina": 2.4, "heavy": 2.2, "lonspa": 1.8},
+    "ルーラーシップ": {"stamina": 2.4, "heavy": 2.9, "lonspa": 1.9},
+    "ハービンジャー": {"stamina": 2.3, "heavy": 3.1, "lonspa": 1.9},
+    "キングカメハメハ": {"stamina": 2.0, "heavy": 2.2, "lonspa": 1.5},
+    "サートゥルナーリア": {"stamina": 1.8, "heavy": 1.8, "lonspa": 1.6},
+    "モーリス": {"stamina": 1.9, "heavy": 2.9, "lonspa": 1.8},
+    "ロベルト": {"stamina": 2.2, "heavy": 3.0, "lonspa": 1.8},
+    "サドラーズウェルズ": {"stamina": 3.0, "heavy": 3.2, "lonspa": 2.0},
+    "Galileo": {"stamina": 3.0, "heavy": 3.0, "lonspa": 2.0},
+    "Montjeu": {"stamina": 3.0, "heavy": 3.2, "lonspa": 2.0},
+    "バゴ": {"stamina": 2.4, "heavy": 3.2, "lonspa": 1.8},
+    "ジャスタウェイ": {"stamina": 1.8, "heavy": 1.8, "lonspa": 1.5},
+    "リアルスティール": {"stamina": 1.8, "heavy": 1.4, "lonspa": 1.5},
+    "シルバーステート": {"stamina": 1.7, "heavy": 2.5, "lonspa": 1.5},
+    "アルアイン": {"stamina": 1.8, "heavy": 2.3, "lonspa": 1.5},
+    "リオンディーズ": {"stamina": 2.0, "heavy": 2.2, "lonspa": 1.5},
+    "ブリックスアンドモルタル": {"stamina": 1.6, "heavy": 1.6, "lonspa": 1.4},
+    "エイシンフラッシュ": {"stamina": 2.0, "heavy": 2.0, "lonspa": 1.5},
+    "ノヴェリスト": {"stamina": 2.4, "heavy": 2.7, "lonspa": 1.6},
+    "シンボリクリスエス": {"stamina": 2.2, "heavy": 2.5, "lonspa": 1.8},
+    "ネオユニヴァース": {"stamina": 2.2, "heavy": 2.6, "lonspa": 1.6},
     "Malibu Moon": {"stamina": 1.8, "heavy": 2.0, "lonspa": 1.5},
-    "ロードカナロア": {"stamina": 0.8, "heavy": 1.2, "lonspa": 1.0},
-    "ダイワメジャー": {"stamina": -0.5, "heavy": 1.8, "lonspa": 0.5},
-    "クロフネ": {"stamina": 0.0, "heavy": 2.0, "lonspa": 0.8},
+    "ロードカナロア": {"stamina": 0.8, "heavy": 1.4, "lonspa": 1.0},
+    "ダイワメジャー": {"stamina": -0.5, "heavy": 1.9, "lonspa": 0.5},
+    "クロフネ": {"stamina": 0.0, "heavy": 2.2, "lonspa": 0.8},
     "イスラボニータ": {"stamina": 0.5, "heavy": 1.5, "lonspa": 0.8},
     "シスキン": {"stamina": 0.5, "heavy": 1.5, "lonspa": 0.8},
-    "ポエティックフレア": {"stamina": 0.5, "heavy": 1.5, "lonspa": 0.8},
-    "ナダル": {"stamina": 1.0, "heavy": 2.2, "lonspa": 1.0},
-    "ドレフォン": {"stamina": 0.5, "heavy": 2.0, "lonspa": 0.8},
-    "マインドユアビスケッツ": {"stamina": 0.5, "heavy": 2.0, "lonspa": 0.8},
+    "ポエティックフレア": {"stamina": 0.5, "heavy": 1.8, "lonspa": 0.8},
+    "ナダル": {"stamina": 1.0, "heavy": 2.4, "lonspa": 1.0},
+    "ドレフォン": {"stamina": 0.5, "heavy": 2.2, "lonspa": 0.8},
+    "マインドユアビスケッツ": {"stamina": 0.5, "heavy": 2.2, "lonspa": 0.8},
     "グレーターロンドン": {"stamina": -1.2, "heavy": 0.0, "lonspa": 0.5},
     "ミッキーアイル": {"stamina": -1.5, "heavy": 1.0, "lonspa": 0.2},
     "ビッグアーサー": {"stamina": -2.0, "heavy": 1.0, "lonspa": 0.0},
@@ -99,8 +98,8 @@ SIRE_APTITUDE_DB: Dict[str, Dict[str, float]] = {
     "タワーオブロンドン": {"stamina": -1.8, "heavy": 1.0, "lonspa": 0.0},
     "アドマイヤムーン": {"stamina": -1.5, "heavy": 1.2, "lonspa": 0.0},
     "サクラバクシンオー": {"stamina": -2.0, "heavy": 1.0, "lonspa": 0.0},
-    "ヘニーヒューズ": {"stamina": -1.5, "heavy": 2.0, "lonspa": 0.2},
-    "シニスターミニスター": {"stamina": -0.5, "heavy": 2.2, "lonspa": 0.5},
+    "ヘニーヒューズ": {"stamina": -1.5, "heavy": 2.2, "lonspa": 0.2},
+    "シニスターミニスター": {"stamina": -0.5, "heavy": 2.5, "lonspa": 0.5},
 }
 
 KNOWN_HORSE_PEDIGREE: Dict[str, Dict[str, str]] = {
@@ -122,6 +121,7 @@ KNOWN_HORSE_PEDIGREE: Dict[str, Dict[str, str]] = {
     "ラージアンサンブル": {"sire": "ルーラーシップ", "bms": "ディープインパクト"},
     "チャリングクロス": {"sire": "サートゥルナーリア", "bms": "キングカメハメハ"},
     "ショウナンガルフ": {"sire": "キズナ", "bms": "キングカメハメハ"},
+    "レガレイラ": {"sire": "スワーヴリチャード", "bms": "ハービンジャー"},
 }
 
 TRAINING_RANK_MULTIPLIERS: Dict[str, float] = {
@@ -132,33 +132,33 @@ TRAINING_RANK_MULTIPLIERS: Dict[str, float] = {
 }
 
 JOCKEY_STAGE_BONUSES: Dict[str, Dict[str, float]] = {
-    "ルメール": {"high_speed": 1.022, "long_dist": 1.022, "outer_smooth": 1.015},
-    "C.ルメール": {"high_speed": 1.022, "long_dist": 1.022, "outer_smooth": 1.015},
-    "川田": {"good_pos": 1.020, "inner_pocket": 1.018},
-    "川田将雅": {"good_pos": 1.020, "inner_pocket": 1.018},
+    "ルメール": {"high_speed": 1.022, "long_dist": 1.022, "outer_smooth": 1.015, "heavy_track": 1.018},
+    "C.ルメール": {"high_speed": 1.022, "long_dist": 1.022, "outer_smooth": 1.015, "heavy_track": 1.018},
+    "川田": {"good_pos": 1.020, "inner_pocket": 1.018, "heavy_track": 1.018},
+    "川田将雅": {"good_pos": 1.020, "inner_pocket": 1.018, "heavy_track": 1.018},
     "戸崎圭": {"outer_smooth": 1.018, "high_speed": 1.015},
     "戸崎圭太": {"outer_smooth": 1.018, "high_speed": 1.015},
-    "武豊": {"pace_make": 1.022, "long_dist": 1.020},
+    "武豊": {"pace_make": 1.022, "long_dist": 1.020, "heavy_track": 1.018},
     "坂井": {"front_keep": 1.020, "inner_pocket": 1.015},
     "坂井瑠星": {"front_keep": 1.020, "inner_pocket": 1.015},
-    "横山典": {"pace_make": 1.020, "inner_pocket": 1.018},
-    "横山典弘": {"pace_make": 1.020, "inner_pocket": 1.018},
-    "横山武": {"front_keep": 1.016, "makuri": 1.018},
-    "横山武史": {"front_keep": 1.016, "makuri": 1.018},
-    "松山": {"outer_smooth": 1.015, "front_keep": 1.015},
-    "松山弘平": {"outer_smooth": 1.015, "front_keep": 1.015},
+    "横山典": {"pace_make": 1.020, "inner_pocket": 1.018, "heavy_track": 1.022},
+    "横山典弘": {"pace_make": 1.020, "inner_pocket": 1.018, "heavy_track": 1.022},
+    "横山武": {"front_keep": 1.016, "makuri": 1.018, "heavy_track": 1.018},
+    "横山武史": {"front_keep": 1.016, "makuri": 1.018, "heavy_track": 1.018},
+    "松山": {"outer_smooth": 1.015, "front_keep": 1.015, "heavy_track": 1.018},
+    "松山弘平": {"outer_smooth": 1.015, "front_keep": 1.015, "heavy_track": 1.018},
     "岩田望": {"inner_pocket": 1.016, "high_speed": 1.015},
     "岩田望来": {"inner_pocket": 1.016, "high_speed": 1.015},
-    "岩田康": {"inner_pocket": 1.022, "pace_make": 1.018},
-    "岩田康誠": {"inner_pocket": 1.022, "pace_make": 1.018},
-    "C.デムーロ": {"inner_pocket": 1.020, "high_speed": 1.018},
-    "M.デムーロ": {"makuri": 1.020, "outer_smooth": 1.015},
-    "丹内": {"makuri": 1.018, "front_keep": 1.015},
-    "丹内祐次": {"makuri": 1.018, "front_keep": 1.015},
+    "岩田康": {"inner_pocket": 1.022, "pace_make": 1.018, "heavy_track": 1.022},
+    "岩田康誠": {"inner_pocket": 1.022, "pace_make": 1.018, "heavy_track": 1.022},
+    "C.デムーロ": {"inner_pocket": 1.020, "high_speed": 1.018, "heavy_track": 1.022},
+    "M.デムーロ": {"makuri": 1.020, "outer_smooth": 1.015, "heavy_track": 1.020},
+    "丹内": {"makuri": 1.018, "front_keep": 1.015, "heavy_track": 1.018},
+    "丹内祐次": {"makuri": 1.018, "front_keep": 1.015, "heavy_track": 1.018},
     "古川吉": {"makuri": 1.016, "outer_smooth": 1.015},
     "古川吉洋": {"makuri": 1.016, "outer_smooth": 1.015},
-    "幸": {"front_keep": 1.015, "inner_pocket": 1.015},
-    "幸英明": {"front_keep": 1.015, "inner_pocket": 1.015},
+    "幸": {"front_keep": 1.015, "inner_pocket": 1.015, "heavy_track": 1.018},
+    "幸英明": {"front_keep": 1.015, "inner_pocket": 1.015, "heavy_track": 1.018},
     "津村": {"front_keep": 1.015, "inner_pocket": 1.015},
     "津村明秀": {"front_keep": 1.015, "inner_pocket": 1.015},
     "菊沢": {"front_keep": 1.012, "outer_smooth": 1.012},
@@ -167,9 +167,6 @@ JOCKEY_STAGE_BONUSES: Dict[str, Dict[str, float]] = {
 
 
 def cached_get_html(url: str, headers: dict, timeout: float = 3.5, use_cache: bool = True) -> Optional[str]:
-    """
-    高速・軽量化用のHTTP取得ラッパー（重複リクエストを防止し、短いタイムアウトで即座に切り上げる）
-    """
     if use_cache and url in html_response_cache:
         return html_response_cache[url]
     try:
@@ -197,6 +194,7 @@ def safe_encode(encoder_name, value):
         return le.transform([value])[0]
     return 0
 
+
 def parse_time_to_seconds(time_val):
     if time_val is None or time_val == '-' or time_val == '':
         return None
@@ -209,6 +207,7 @@ def parse_time_to_seconds(time_val):
     except:
         return None
 
+
 def format_seconds_to_time_str(sec_val: float) -> str:
     try:
         m = int(sec_val // 60)
@@ -216,6 +215,7 @@ def format_seconds_to_time_str(sec_val: float) -> str:
         return f"{m}:{s:04.1f}"
     except:
         return "-"
+
 
 def parse_date_str(d_str: str) -> Optional[datetime]:
     if not d_str:
@@ -229,6 +229,7 @@ def parse_date_str(d_str: str) -> Optional[datetime]:
             return None
     return None
 
+
 def extract_target_race_date(shutuba_html: str) -> Optional[datetime]:
     title_m = re.search(r'<title>(.*?)</title>', shutuba_html, re.IGNORECASE | re.DOTALL)
     if title_m:
@@ -240,6 +241,7 @@ def extract_target_race_date(shutuba_html: str) -> Optional[datetime]:
             except:
                 pass
     return None
+
 
 def extract_course_rail_info(shutuba_html: str) -> tuple[str, str]:
     m_rail = re.search(r'\b([A-DＡ-Ｄ])コース\b', shutuba_html)
@@ -255,6 +257,7 @@ def extract_course_rail_info(shutuba_html: str) -> tuple[str, str]:
             return 'D', '🌱 仮柵: Dコース（Aから9m外移動・直線外持ち出しの持続差し警戒）'
     return '', ''
 
+
 def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -> float:
     std_t = c_stats.get('standard_time')
     if std_t is not None:
@@ -267,21 +270,21 @@ def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -
     sec_per_meter = 0.0595 if course_type == "芝" else 0.0620
     return round(distance * sec_per_meter, 1)
 
+
 def infer_class_factor(record: dict) -> float:
     if 'class_factor' in record and record['class_factor'] is not None:
         try:
             val = float(record['class_factor'])
             r_check = str(record.get('race_name', '')) + str(record.get('grade', ''))
-            if any(k in r_check for k in ['G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞', 'ホープフル', '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC']):
+            if any(k in r_check for k in ['G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞', 'ホープフル', '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC', 'エリザベス女王', 'マイルCS']):
                 return max(val, 1.22)
-            if any(k in r_check for k in ['G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞', 'スプリングS', 'ローズS', '紫苑S']):
+            if any(k in r_check for k in ['G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞', 'スプリングS', 'ローズS', '紫苑S', 'アルゼンチン', 'オールカマー']):
                 return max(val, 1.12)
             return val
         except:
             pass
 
     r_name = str(record.get('race_name', '')) + " " + str(record.get('grade', ''))
-
     g1_keywords = [
         'G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞',
         '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC', 'ジャパンカップ', 'ホープフル',
@@ -291,12 +294,12 @@ def infer_class_factor(record: dict) -> float:
     g2_keywords = [
         'G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞',
         'スプリングS', 'ローズS', '紫苑S', 'フローラS', 'チューリップ', '毎日王冠',
-        '京都大賞典', 'オールカマー', '札幌記念', '日経賞', '阪神大賞典', '日経新春', '金鯱賞', '東スポ杯'
+        '京都大賞典', 'オールカマー', '札幌記念', '日経賞', '阪神大賞典', '日経新春', '金鯱賞', '東スポ杯', 'アルゼンチン'
     ]
     g3_keywords = [
         'G3', 'GIII', '共同通信', 'きさらぎ', '京成杯', 'シンザン', 'フェアリー',
         'クイーンC', '毎日杯', 'フラワーC', 'ファルコン', 'アーリントン', 'ラジオNIKKEI',
-        'レパード', 'ユニコーン', '新潟記念', '小倉記念', '七夕賞', 'エプソム'
+        'レパード', 'ユニコーン', '新潟記念', '小倉記念', '七夕賞', 'エプソム', 'みやこS'
     ]
 
     for kw in g1_keywords:
@@ -310,17 +313,15 @@ def infer_class_factor(record: dict) -> float:
     if '2勝' in r_name or '1000万' in r_name: return 0.78
     if '1勝' in r_name or '500万' in r_name: return 0.68
     if '未勝利' in r_name or '新馬' in r_name: return 0.58
-
     if 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name or '賞' in r_name or '特別' in r_name:
         return 0.94
-
     return 0.72
+
 
 def infer_margin_seconds(record: dict) -> float:
     if 'margin' in record and record['margin'] is not None:
         try:
-            val = float(record['margin'])
-            return max(0.0, val)
+            return max(0.0, float(record['margin']))
         except:
             pass
     try:
@@ -345,23 +346,19 @@ def estimate_horse_early_3f_speed(bamei_str: str) -> float:
         try:
             c_str = str(r.get('course', ''))
             m_d = re.search(r'(\d{3,4})', c_str)
-            if not m_d:
-                continue
+            if not m_d: continue
             dist = int(m_d.group(1))
-            if dist <= 800:
-                continue
+            if dist <= 800: continue
             sec = parse_time_to_seconds(r.get('time'))
             up = float(r.get('up', 0))
-            if sec is None or up <= 30.0 or sec <= up:
-                continue
+            if sec is None or up <= 30.0 or sec <= up: continue
 
             base_first_3f = ((sec - up) / (dist - 600.0)) * 600.0
             passing = str(r.get('passing', ''))
             first_corner = 6
             if passing and passing != '-':
                 p_nums = [int(x) for x in passing.split('-') if x.strip().isdigit()]
-                if p_nums:
-                    first_corner = p_nums[0]
+                if p_nums: first_corner = p_nums[0]
 
             pos_adj = (first_corner - 5) * 0.08
             est_val = base_first_3f + pos_adj
@@ -383,13 +380,20 @@ def evaluate_lap_gear_aptitude(
     track_cond: str,
     expected_pace: str
 ) -> tuple[float, str]:
-    records = get_active_horse_records(bamei_str)[-6:]
+    """
+    ・良馬場＆高クッション値: 33秒台前半の『⚡極限瞬発ギア◎』や『🔥L4F持続ロンスパ◎』を評価
+    ・雨・道悪（稍重/重/不良 または クッション値8.9以下）: 良馬場の高速上がり偏重をオフにし、
+      道悪好走実績やタフ馬場（上がり35秒以上かかる消耗戦）での上位上がり実績を『☔道悪・タフ馬場ギア◎』として大幅ブースト
+    """
+    records = get_active_horse_records(bamei_str)[-8:]
     if not records:
         return 1.00, ""
 
     best_turf_up = 99.0
     agari_top2_cnt = 0
     sustained_good_runs = 0
+    wet_good_runs = 0
+    tough_agari_good_runs = 0
 
     for r in records:
         try:
@@ -398,7 +402,14 @@ def evaluate_lap_gear_aptitude(
             mg = infer_margin_seconds(r)
             up_val = float(r.get('up', 99.0))
             ag_rk = int(r.get('agari_rank', 99))
+            cnd = str(r.get('cond', '良'))
             pci_val = calc_single_pci(c_str, r.get('time', ''), r.get('up', ''))
+
+            if cnd in ['稍', '重', '不'] and (rk <= 3.0 or mg <= 0.3):
+                wet_good_runs += 1
+
+            if up_val >= 35.0 and (ag_rk <= 3 or rk <= 2.0) and (rk <= 4.0 or mg <= 0.35):
+                tough_agari_good_runs += 1
 
             if '芝' in c_str and 31.5 <= up_val <= 38.0:
                 if rk <= 5.0 or mg <= 0.5:
@@ -408,24 +419,36 @@ def evaluate_lap_gear_aptitude(
             if ag_rk in [1, 2] and (rk <= 5.0 or mg <= 0.4):
                 agari_top2_cnt += 1
 
-            if pci_val is not None and 47.0 <= pci_val <= 51.8 and (rk <= 3.0 or mg <= 0.25):
+            if pci_val is not None and 46.5 <= pci_val <= 51.5 and (rk <= 3.0 or mg <= 0.25):
                 sustained_good_runs += 1
         except:
             continue
 
-    is_fast_turf = (course_type == "芝" and track_cond == "良" and cushion_val >= 9.4)
+    is_wet_or_tough = (track_cond in ["稍", "重", "不"]) or (cushion_val <= 8.9)
     gear_mult = 1.00
     gear_label = ""
 
-    if is_fast_turf and best_turf_up <= 33.4:
-        gear_mult = 1.035 if agari_top2_cnt >= 1 else 1.025
-        gear_label = f"⚡極限瞬発ギア◎(最高上り{best_turf_up:.1f}秒)"
-    elif course_type == "芝" and best_turf_up <= 33.8 and agari_top2_cnt >= 2:
-        gear_mult = 1.022
-        gear_label = f"⚡鋭伸ギア○(上り上位{agari_top2_cnt}回)"
-    elif sustained_good_runs >= 2 and expected_pace in ["S_LONSPA", "M_LONSPA", "H_MAEKUZURE", "M_JIRIKI"]:
-        gear_mult = 1.022
-        gear_label = "🔥L4F持続ロンスパ◎"
+    if is_wet_or_tough:
+        if wet_good_runs >= 2 or (wet_good_runs >= 1 and tough_agari_good_runs >= 1):
+            gear_mult = 1.050 if track_cond in ["重", "不"] else 1.038
+            gear_label = f"☔道悪巧者・パワーギア◎(道悪好走{wet_good_runs}回)"
+        elif wet_good_runs == 1 or tough_agari_good_runs >= 2:
+            gear_mult = 1.030 if track_cond in ["重", "不"] else 1.022
+            gear_label = "🌧️タフ馬場・消耗戦ギア○"
+        elif sustained_good_runs >= 2:
+            gear_mult = 1.018
+            gear_label = "🔥L4F持続ロンスパ◎"
+    else:
+        is_fast_turf = (course_type == "芝" and track_cond == "良" and cushion_val >= 9.4)
+        if is_fast_turf and best_turf_up <= 33.4:
+            gear_mult = 1.035 if agari_top2_cnt >= 1 else 1.025
+            gear_label = f"⚡極限瞬発ギア◎(最高上り{best_turf_up:.1f}秒)"
+        elif course_type == "芝" and best_turf_up <= 33.8 and agari_top2_cnt >= 2:
+            gear_mult = 1.022
+            gear_label = f"⚡鋭伸ギア○(上り上位{agari_top2_cnt}回)"
+        elif sustained_good_runs >= 2 and expected_pace in ["S_LONSPA", "M_LONSPA", "H_MAEKUZURE", "M_JIRIKI"]:
+            gear_mult = 1.022
+            gear_label = "🔥L4F持続ロンスパ◎"
 
     return gear_mult, gear_label
 
@@ -435,18 +458,27 @@ def evaluate_box_in_and_lead_risk(
     umaban_val: float,
     kyakushitsu_val: float,
     odds_val: float,
+    kinryou_val: float,
     stage1_rank: int,
     stage1_gap_to_2nd: float,
     total_horses: int,
     all_horses_early_info: List[Dict[str, Any]],
     course_type: str,
     distance: int,
-    cushion_val: float
+    cushion_val: float,
+    fav_closer_skew: bool = False
 ) -> tuple[float, List[str], str]:
+    """
+    ① 多頭数の内枠包まれリスク（圧倒的1強は保護）
+    ② テン3F比較による単騎ハナ・好位スムーズ判定
+    ③ アルゼンチン共和国杯対策：上位人気が差し・追込偏重（fav_closer_skew=True）または少先行馬の時、
+       前〜好位（脚質1・2）の馬に『🔥前残り警戒穴（後方牽制恩恵）』ボーナスを付与
+    """
     waku = int(round(float(wakuban_val)))
     umaban = int(round(float(umaban_val)))
     kyaku = int(round(float(kyakushitsu_val)))
     odds = float(odds_val) if odds_val else 10.0
+    kinryou = float(kinryou_val) if kinryou_val else 55.0
 
     is_dominant_lone_leader = (stage1_rank == 1 and stage1_gap_to_2nd >= 3.0)
 
@@ -458,6 +490,9 @@ def evaluate_box_in_and_lead_risk(
         if x["umaban"] > umaban and x["kyakushitsu"] <= 2 and x["early_3f"] <= my_early_3f + 0.3
     )
     total_nige_horses = [x for x in all_horses_early_info if x["kyakushitsu"] == 1]
+    total_front_horses = [x for x in all_horses_early_info if x["kyakushitsu"] <= 2]
+
+    is_front_scarce_or_skewed = fav_closer_skew or (len(total_front_horses) <= max(3, total_horses // 4))
 
     tactical_mult = 1.000
     badges: List[str] = []
@@ -469,8 +504,8 @@ def evaluate_box_in_and_lead_risk(
             if x["umaban"] != umaban and x["early_3f"] <= my_early_3f + 0.25
         ]
         if len(total_nige_horses) == 1 or len(faster_or_equal_nige) == 0:
-            tactical_mult *= 1.025
-            badges.append("🚀単騎ハナ濃厚◎")
+            tactical_mult *= 1.038 if is_front_scarce_or_skewed else 1.025
+            badges.append("🚀単騎ハナ濃厚・セーフティリード◎" if is_front_scarce_or_skewed else "🚀単騎ハナ濃厚◎")
         elif len(faster_or_equal_nige) >= 2:
             if is_dominant_lone_leader:
                 tactical_mult *= 0.992
@@ -481,9 +516,21 @@ def evaluate_box_in_and_lead_risk(
                 risk_level = "PACE_PRESSURE"
 
     elif kyaku == 2:
-        if waku <= 5 and outer_front_runners <= 2 and my_early_3f <= 35.4:
-            tactical_mult *= 1.015
+        if waku <= 5 and outer_front_runners <= 2 and my_early_3f <= 35.5:
+            tactical_mult *= 1.028 if is_front_scarce_or_skewed else 1.015
             badges.append("🎯好位先手スムーズ○")
+        elif is_front_scarce_or_skewed:
+            tactical_mult *= 1.025
+            if odds >= 7.0:
+                badges.append("🔥前残り警戒穴(人気馬後方牽制)")
+            else:
+                badges.append("🔥好位セーフティリード◎")
+
+        # 長距離・ハンデ戦での軽量×好位シナジー（アルゼンチン共和国杯のファミリータイム・ジーティーダーリン型）
+        if distance >= 2000 and kinryou <= 56.0 and odds >= 6.0:
+            tactical_mult *= 1.018
+            if "🔥前残り警戒穴(人気馬後方牽制)" not in badges:
+                badges.append("🔥軽斤量×好位粘り込み警戒")
 
     is_crowded_field = (total_horses >= 14)
     is_inner_trap_zone = (waku <= 3) or (waku == 4 and kyaku >= 3 and total_horses >= 15)
@@ -524,7 +571,8 @@ def evaluate_jockey_stage_synergy(
     kyakushitsu: int,
     distance: int,
     cushion_val: float,
-    makuri_flag: bool
+    makuri_flag: bool,
+    track_cond: str = "良"
 ) -> tuple[float, str]:
     clean_k = re.sub(r'[▲△☆◇★\s]', '', str(kishu_name or ""))
     prof = None
@@ -537,10 +585,13 @@ def evaluate_jockey_stage_synergy(
 
     mult = 1.000
     notes = []
+    if (track_cond in ["稍", "重", "不"] or cushion_val <= 8.9) and "heavy_track" in prof:
+        mult = max(mult, prof["heavy_track"])
+        notes.append("道悪エスコート◎")
     if distance >= 2400 and "long_dist" in prof:
         mult = max(mult, prof["long_dist"])
         notes.append("長距離手腕◎")
-    if cushion_val >= 9.5 and "high_speed" in prof:
+    if cushion_val >= 9.5 and track_cond == "良" and "high_speed" in prof:
         mult = max(mult, prof["high_speed"])
         notes.append("高速馬場手腕◎")
     if wakuban <= 3 and "inner_pocket" in prof:
@@ -577,10 +628,7 @@ def build_horse_history_details(bamei_str: str, place_dict: Dict[str, str]) -> L
         distance_label = f"{place}{c_type}{dist}m({cond_str})"
 
         if raw_rname:
-            if grade_s and grade_s not in raw_rname:
-                display_race_name = f"{raw_rname}({grade_s})"
-            else:
-                display_race_name = raw_rname
+            display_race_name = f"{raw_rname}({grade_s})" if (grade_s and grade_s not in raw_rname) else raw_rname
         else:
             display_race_name = f"{place} {c_type}{dist}m ({cond_str})"
 
@@ -636,19 +684,15 @@ def is_same_race_series(target_clean: str, cand_clean: str) -> bool:
         return False
     if target_clean == cand_clean:
         return True
-
     if "天皇賞" in target_clean or "天皇賞" in cand_clean:
-        if ("春" in target_clean) != ("春" in cand_clean):
-            return False
-        if ("秋" in target_clean) != ("秋" in cand_clean):
-            return False
+        if ("春" in target_clean) != ("春" in cand_clean): return False
+        if ("秋" in target_clean) != ("秋" in cand_clean): return False
         return "天皇賞" in target_clean and "天皇賞" in cand_clean
 
     t_short = target_clean.replace('ステークス', 'S').replace('カップ', 'C').replace('記念', '')
     c_short = cand_clean.replace('ステークス', 'S').replace('カップ', 'C').replace('記念', '')
     if t_short and c_short and (t_short == c_short or t_short in c_short or c_short in t_short):
         return True
-
     return False
 
 
@@ -667,20 +711,13 @@ def extract_html_race_metadata(html_text: str) -> tuple[str, Optional[str], Opti
             title_str = re.sub(r'<[^>]*>', '', m_title.group(1)).strip()
 
     clean_title = normalize_race_title(title_str)
-
     c_type = None
     dist_val = None
     m_td = re.search(r'(芝|ダート|ダ|障害|障)\s*(?:右|左|直|外|内|\s|・)*?(\d{3,4})\s*m', html_text)
     if m_td:
         raw_t = m_td.group(1)
-        if raw_t in ['ダート', 'ダ']:
-            c_type = 'ダ'
-        elif raw_t in ['障害', '障']:
-            c_type = '障'
-        else:
-            c_type = '芝'
+        c_type = 'ダ' if raw_t in ['ダート', 'ダ'] else ('障' if raw_t in ['障害', '障'] else '芝')
         dist_val = int(m_td.group(2))
-
     return clean_title, c_type, dist_val
 
 
@@ -702,7 +739,6 @@ def parse_race_result_benchmark_from_html(
     if strict_validation:
         if expected_course_type and cand_course_type and expected_course_type != cand_course_type:
             return None
-
         if is_named_race and target_clean_title and cand_clean_title:
             if not is_same_race_series(target_clean_title, cand_clean_title):
                 return None
@@ -721,7 +757,6 @@ def parse_race_result_benchmark_from_html(
         tds = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
         if len(tds) < 8:
             continue
-
         rank_str = re.sub(r'<[^>]*>', '', tds[0]).strip()
         if not rank_str.isdigit():
             continue
@@ -742,9 +777,7 @@ def parse_race_result_benchmark_from_html(
         if b_m:
             bamei = re.sub(r'<[^>]*>', '', b_m.group(1)).strip()
 
-        row_clean = re.sub(r'<[^>]*>', ' ', row)
-        row_clean = re.sub(r'\s+', ' ', row_clean).strip()
-
+        row_clean = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', row)).strip()
         time_str = "-"
         m_tm = re.search(r'(\d:\d{2}\.\d)', row_clean)
         if m_tm:
@@ -776,7 +809,6 @@ def parse_race_result_benchmark_from_html(
             "up": up_str,
             "passing": passing_str
         })
-
         if len(top3_list) >= 3:
             break
 
@@ -791,17 +823,12 @@ def parse_race_result_benchmark_from_html(
     if expected_distance:
         win_sec = parse_time_to_seconds(winner_time)
         if win_sec is not None:
-            min_plausible_sec = expected_distance * 0.052
-            max_plausible_sec = expected_distance * 0.075
-            if not (min_plausible_sec <= win_sec <= max_plausible_sec):
+            if not (expected_distance * 0.052 <= win_sec <= expected_distance * 0.075):
                 return None
 
     year_m = re.search(r'(20\d{2})年', html_text)
     year_str = f"{year_m.group(1)}年" if year_m else label_prefix
-
-    display_label = label_prefix
-    if cand_clean_title and cand_clean_title not in label_prefix:
-        display_label = f"{label_prefix} [{cand_clean_title}]"
+    display_label = f"{label_prefix} [{cand_clean_title}]" if (cand_clean_title and cand_clean_title not in label_prefix) else label_prefix
 
     return {
         "label": display_label,
@@ -822,13 +849,9 @@ def fetch_reference_race_benchmarks(
     race_name: str = "",
     start_ts: float = 0.0
 ) -> Dict[str, Any]:
-    """
-    高速・軽量版の前年＆今年度ベンチマーク取得（重いdb.netkeiba.com検索を廃止し、race.netkeiba.comのキャッシュとdata_listのみを使用）
-    """
     current_year_bench = None
     prev_year_bench = None
 
-    # 1. 今年度結果（すでにオッズ取得でキャッシュされていれば通信0秒で即取得）
     cur_html = cached_get_html(
         f"https://race.netkeiba.com/race/result.html?race_id={race_id}",
         headers, timeout=3.0
@@ -843,7 +866,6 @@ def fetch_reference_race_benchmarks(
             strict_validation=False
         )
 
-    # 2. 前年度（同レース）の高速特定（最大3〜4回の軽量通信のみ）
     if len(race_id) == 12 and race_id.isdigit() and (start_ts == 0.0 or (time.time() - start_ts) < 7.0):
         prev_year = int(race_id[:4]) - 1
         place_code = race_id[4:6]
@@ -852,8 +874,6 @@ def fetch_reference_race_benchmarks(
         r_num = int(race_id[10:12])
 
         cand_ids: List[str] = []
-
-        # (A) data_list.html 1ページだけから過去同レースのIDを高速抽出
         data_html = cached_get_html(
             f"https://race.netkeiba.com/race/data_list.html?race_id={race_id}",
             headers, timeout=2.5
@@ -863,7 +883,6 @@ def fetch_reference_race_benchmarks(
                 if fid not in cand_ids:
                     cand_ids.append(fid)
 
-        # (B) 直接の前年IDと開催回±1のID（例: 2025年天皇賞・春の 3回京都4日11R -> 2回京都4日11R）
         direct_prev_id = f"{prev_year}{race_id[4:]}"
         if direct_prev_id not in cand_ids:
             cand_ids.append(direct_prev_id)
@@ -875,7 +894,6 @@ def fetch_reference_race_benchmarks(
                 if adj_id not in cand_ids:
                     cand_ids.append(adj_id)
 
-        # 最大3件まで高速な race.netkeiba.com/race/result.html で照合
         for cid in cand_ids[:3]:
             if start_ts > 0.0 and (time.time() - start_ts) > 7.5:
                 break
@@ -915,10 +933,8 @@ def fetch_reference_race_benchmarks(
     }
 
     primary_bench = current_year_bench or prev_year_bench or fallback_bench
-    is_finished = current_year_bench is not None
-
     return {
-        "is_finished_race": is_finished,
+        "is_finished_race": current_year_bench is not None,
         "primary": primary_bench,
         "current_year": current_year_bench,
         "prev_year": prev_year_bench or fallback_bench
@@ -928,7 +944,6 @@ def fetch_reference_race_benchmarks(
 def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
     sire = ""
     bms = ""
-
     db_entry = horse_history_db.get(bamei, {})
     if isinstance(db_entry, dict):
         sire = str(db_entry.get('sire', db_entry.get('father', db_entry.get('父', '')))).strip()
@@ -1016,8 +1031,7 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
 
             parsed_recent = []
             for p_html in reversed(past_tds):
-                p_text = re.sub(r'<[^>]*>', ' ', p_html)
-                p_text = re.sub(r'\s+', ' ', p_text).strip()
+                p_text = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', p_html)).strip()
                 if not p_text or len(p_text) < 10:
                     continue
 
@@ -1056,8 +1070,7 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                 race_title = ""
                 m_rname = re.search(r'<div[^>]*class="[^"]*Data02[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
                 if m_rname:
-                    race_title = re.sub(r'<[^>]*>', '', m_rname.group(1)).strip()
-                    race_title = re.sub(r'\s+', ' ', race_title)
+                    race_title = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', '', m_rname.group(1)).strip())
 
                 c_type, dist_val, time_str, cond_str = "芝", 2000, "-", "良"
                 m_cd = re.search(r'(芝|ダ|障)\s*(\d{3,4})', p_text)
@@ -1131,20 +1144,13 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                         same_course = (new_r["course"] == str(ex_r.get("course", "")))
                         same_rank = (int(new_r["rank"]) == int(float(ex_r.get("rank", 99))))
                         if (same_time and same_course) or (same_course and same_rank and new_r["up"] == str(ex_r.get("up", ""))):
-                            if new_r["date"]:
-                                ex_r["date"] = new_r["date"]
-                            if new_r["margin"] is not None:
-                                ex_r["margin"] = new_r["margin"]
-                            if new_r["grade"]:
-                                ex_r["grade"] = new_r["grade"]
-                            if new_r["race_name"]:
-                                ex_r["race_name"] = new_r["race_name"]
-                            if new_r["passing"] != "-":
-                                ex_r["passing"] = new_r["passing"]
-                            if new_r["agari_rank"] <= 3:
-                                ex_r["agari_rank"] = new_r["agari_rank"]
-                            if new_r["weight"] and not ex_r.get("weight"):
-                                ex_r["weight"] = new_r["weight"]
+                            if new_r["date"]: ex_r["date"] = new_r["date"]
+                            if new_r["margin"] is not None: ex_r["margin"] = new_r["margin"]
+                            if new_r["grade"]: ex_r["grade"] = new_r["grade"]
+                            if new_r["race_name"]: ex_r["race_name"] = new_r["race_name"]
+                            if new_r["passing"] != "-": ex_r["passing"] = new_r["passing"]
+                            if new_r["agari_rank"] <= 3: ex_r["agari_rank"] = new_r["agari_rank"]
+                            if new_r["weight"] and not ex_r.get("weight"): ex_r["weight"] = new_r["weight"]
                             matched = True
                             break
                     if not matched:
@@ -1181,6 +1187,10 @@ def get_horse_pedigree_info(bamei_str: str) -> Dict[str, str]:
 def evaluate_pedigree_and_distance_aptitude(
     bamei: str, course_type: str, target_distance: int, track_cond: str, cushion_val: float
 ) -> tuple[float, float, str]:
+    """
+    血統×距離×馬場状態（雨・道悪）のシナジー評価。
+    雨・道悪設定時（稍重/重/不良 または クッション値8.9以下）は、道悪血統＋道悪好走実績の加点幅を最大1.08倍まで引き上げる。
+    """
     ped = get_horse_pedigree_info(bamei)
     sire = ped.get("sire", "")
     bms = ped.get("bms", "")
@@ -1209,38 +1219,32 @@ def evaluate_pedigree_and_distance_aptitude(
             if rk <= 3.0 or mg <= 0.3:
                 if d_val > max_good_dist:
                     max_good_dist = d_val
-                if target_distance >= 2400 and d_val >= 2500 and rk <= 2.0:
+                if target_distance >= 2200 and d_val >= 2200 and rk <= 2.0:
                     proven_long_dist_wins += 1
-                if cnd in ['稍', '重', '不'] and (rk <= 2.0 or mg <= 0.2):
+                if cnd in ['稍', '重', '不'] and (rk <= 3.0 or mg <= 0.25):
                     proven_heavy_good_runs += 1
         except:
             continue
 
     dist_extension = (target_distance - max_good_dist) if max_good_dist > 0 else 0
-
     dist_mult = 1.00
     notes = []
 
-    if target_distance >= 2400:
-        if stamina_index >= 2.6:
-            dist_mult *= 1.035 if target_distance >= 2800 else 1.025
-            notes.append("長距離血統◎")
-        elif stamina_index >= 2.1:
+    if target_distance >= 2200:
+        if stamina_index >= 2.5:
+            dist_mult *= 1.035 if target_distance >= 2500 else 1.025
+            notes.append("中長距離血統◎")
+        elif stamina_index >= 2.0:
             dist_mult *= 1.015
-            notes.append("中長距離血統○")
+            notes.append("距離血統○")
         elif stamina_index <= -0.5:
-            dist_mult *= 0.945 if target_distance >= 2800 else 0.965
-            notes.append("距離延長不安")
+            dist_mult *= 0.955
 
-        if dist_extension >= 400:
-            if stamina_index >= 2.7:
-                dist_mult *= 1.012
-            elif stamina_index <= 0.0:
-                dist_mult *= 0.975
-
+        if dist_extension >= 400 and stamina_index >= 2.6:
+            dist_mult *= 1.012
         if proven_long_dist_wins >= 1:
             dist_mult *= 1.022
-            notes.append("長距離実績◎")
+            notes.append("距離実績◎")
 
     elif target_distance <= 1400:
         if stamina_index <= -1.0:
@@ -1249,27 +1253,36 @@ def evaluate_pedigree_and_distance_aptitude(
             dist_mult *= 0.97
 
     heavy_mult = 1.00
-    is_wet_or_tough = (track_cond in ["稍", "重", "不"]) or (cushion_val <= 9.2)
+    is_wet_or_tough = (track_cond in ["稍", "重", "不"]) or (cushion_val <= 8.9)
     if is_wet_or_tough:
-        if heavy_index >= 2.4:
+        if heavy_index >= 2.5:
+            heavy_mult *= 1.045 if track_cond in ["重", "不"] else 1.030
+            notes.append("☔道悪血統◎")
+        elif heavy_index >= 2.0:
             heavy_mult *= 1.025 if track_cond in ["重", "不"] else 1.015
-            notes.append("道悪パワー◎")
-        elif heavy_index <= 0.5 and track_cond in ["重", "不"]:
-            heavy_mult *= 0.97
-        if proven_heavy_good_runs >= 1:
-            heavy_mult *= 1.018
-            notes.append("道悪実績◎")
+            notes.append("☔道悪血統○")
+        elif heavy_index <= 0.7 and track_cond in ["重", "不"]:
+            heavy_mult *= 0.960
 
-    lonspa_mult = 1.01 if (target_distance >= 2000 and lonspa_index >= 1.9) else 1.00
+        if proven_heavy_good_runs >= 2:
+            heavy_mult *= 1.035
+            notes.append("☔道悪実績◎")
+        elif proven_heavy_good_runs == 1:
+            heavy_mult *= 1.020
+            notes.append("☔道悪実績○")
+
+    lonspa_mult = 1.012 if (target_distance >= 2000 and lonspa_index >= 1.9) else 1.00
 
     stage1_ped_mult = float(np.clip(dist_mult, 0.94, 1.05))
-    stage2_ped_mult = float(np.clip(dist_mult * heavy_mult * lonspa_mult, 0.93, 1.07))
+    stage2_ped_mult = float(np.clip(dist_mult * heavy_mult * lonspa_mult, 0.92, 1.09))
 
     ped_label = ""
     if sire:
         bms_str = f"×母父{bms}" if bms else ""
         note_str = f"({','.join(notes[:2])})" if notes else ""
         ped_label = f"🧬父{sire}{bms_str}{note_str}"
+    elif notes:
+        ped_label = f"🧬{','.join(notes[:2])}"
 
     return stage1_ped_mult, stage2_ped_mult, ped_label
 
@@ -1296,25 +1309,14 @@ def evaluate_rotation_aptitude(
     if target_race_date is None or target_race_date <= last_dt:
         if len(dated_recs) >= 2:
             prev_dt, _ = dated_recs[-2]
-            prev_gap = (last_dt - prev_dt).days
-            if prev_gap >= 65:
-                mult = 1.032 if power_score >= 0.74 else 1.022
-                return mult, "🔄叩き2走目(上昇◎)"
+            if (last_dt - prev_dt).days >= 65:
+                return (1.032 if power_score >= 0.74 else 1.022), "🔄叩き2走目(上昇◎)"
         return 1.00, "順調"
 
     days_since_last = (target_race_date - last_dt).days
     weeks_approx = max(1, round(days_since_last / 7.0)) - 1
-
-    gap_before_last = 0
-    if len(dated_recs) >= 2:
-        prev2_dt, _ = dated_recs[-2]
-        gap_before_last = (last_dt - prev2_dt).days
-
-    gap_before_prev2 = 0
-    if len(dated_recs) >= 3:
-        prev3_dt, _ = dated_recs[-3]
-        gap_before_prev2 = (dated_recs[-2][0] - prev3_dt).days
-
+    gap_before_last = (last_dt - dated_recs[-2][0]).days if len(dated_recs) >= 2 else 0
+    gap_before_prev2 = (dated_recs[-2][0] - dated_recs[-3][0]).days if len(dated_recs) >= 3 else 0
     last_cf = infer_class_factor(last_rec)
 
     if gap_before_last >= 60 and 18 <= days_since_last <= 52:
@@ -1326,19 +1328,13 @@ def evaluate_rotation_aptitude(
         return 1.018, f"🔄叩き3走目・中{weeks_approx}週(充実期○)"
 
     if days_since_last >= 150:
-        if power_score >= 0.80:
-            return 0.990, f"鉄砲・休養明け({days_since_last}日ぶり)"
-        return 0.965, f"⚠️長期休養明け({days_since_last}日ぶり)"
+        return (0.990 if power_score >= 0.80 else 0.965), f"休養明け({days_since_last}日ぶり)"
 
     if 70 <= days_since_last < 150:
-        if power_score >= 0.78:
-            return 1.005, f"休み明け・中{weeks_approx}週(外厩仕上)"
-        return 0.985, f"休み明け({days_since_last}日ぶり)"
+        return (1.005 if power_score >= 0.78 else 0.985), f"休み明け・中{weeks_approx}週"
 
     if days_since_last <= 14:
-        if target_distance >= 2200:
-            return 0.970, f"⚠️間隔詰まり(中{max(0, weeks_approx)}週・長距離)"
-        return 0.990, f"間隔詰まり(中{max(0, weeks_approx)}週)"
+        return (0.970 if target_distance >= 2200 else 0.990), f"間隔詰まり(中{max(0, weeks_approx)}週)"
 
     if 21 <= days_since_last <= 52:
         return 1.010, f"好ローテ(中{weeks_approx}週)"
@@ -1361,6 +1357,7 @@ def calc_jra_wakuban(umaban: int, total_horses: int) -> int:
     rem2 = rem - (normal_double_count * 2)
     return single_frames + normal_double_count + math.ceil(rem2 / 3.0)
 
+
 def calc_single_pci(course_str, time_val, up_val):
     try:
         m = re.search(r'(\d{3,4})', str(course_str))
@@ -1377,10 +1374,12 @@ def calc_single_pci(course_str, time_val, up_val):
     except:
         return None
 
+
 def get_pci_label(pci_val):
     if pci_val < 48.0: return "A"
     elif pci_val <= 52.0: return "B"
     else: return "C"
+
 
 def get_horse_pci_stats(bamei_str):
     records = get_active_horse_records(bamei_str)
@@ -1392,9 +1391,10 @@ def get_horse_pci_stats(bamei_str):
         if pci is not None:
             all_pcis.append(pci)
             try:
-                rank = float(r.get('rank', 99))
-                if 1.0 <= rank <= 3.0: good_pcis.append(pci)
-            except: pass
+                if 1.0 <= float(r.get('rank', 99)) <= 3.0:
+                    good_pcis.append(pci)
+            except:
+                pass
     target_pcis = good_pcis if good_pcis else all_pcis
     if not target_pcis: return 50.0, "B"
     avg_pci = round(float(np.mean(target_pcis)), 1)
@@ -1404,19 +1404,20 @@ def get_horse_pci_stats(bamei_str):
 def get_horse_real_stats(bamei_str):
     records = get_active_horse_records(bamei_str)
     if not records: return 8.0, 35.0, 0, 0.5, False
-    
+
     shussou_kaisuu = len(records)
     try:
         raw_zenso = float(records[-1].get('rank', 8.0))
     except:
         raw_zenso = 8.0
-    
+
     up_list = []
     for r in records[-3:]:
         try:
             u = float(r.get('up', 0))
             if 30.0 <= u <= 45.0: up_list.append(u)
-        except: pass
+        except:
+            pass
     avg_agari = round(float(np.mean(up_list)), 2) if up_list else 35.0
 
     makuri_flag = False
@@ -1424,7 +1425,7 @@ def get_horse_real_stats(bamei_str):
     career_scores = []
     graded_floor_score = 0.0
     agari_rank_bonus = 0.0
-    
+
     scan_records = records[-12:]
     recent_start_idx = max(0, len(scan_records) - 5)
 
@@ -1436,7 +1437,8 @@ def get_horse_real_stats(bamei_str):
                 p_nums = [int(x) for x in passing.split('-') if x.isdigit()]
                 if len(p_nums) >= 2 and (p_nums[0] - p_nums[-1]) >= 3:
                     makuri_flag = True
-            except: pass
+            except:
+                pass
 
         cf = infer_class_factor(r)
         margin = infer_margin_seconds(r)
@@ -1444,13 +1446,11 @@ def get_horse_real_stats(bamei_str):
             rk = float(r.get('rank', 99))
         except:
             rk = 99.0
-        
+
         course_str = str(r.get('course', ''))
-        dist = 2000.0
         m_dist = re.search(r'(\d{3,4})', course_str)
-        if m_dist:
-            dist = float(m_dist.group(1))
-            
+        dist = float(m_dist.group(1)) if m_dist else 2000.0
+
         capped_margin = min(max(margin, 0.0), 2.0)
         adjusted_margin = capped_margin * (2000.0 / dist) if dist > 0 else capped_margin
         run_score = float(np.clip(cf - (adjusted_margin * 0.14), 0.10, 1.22))
@@ -1474,11 +1474,9 @@ def get_horse_real_stats(bamei_str):
         ag_rk = int(r.get('agari_rank', 99))
         single_pci = calc_single_pci(course_str, r.get('time', ''), r.get('up', ''))
         if ag_rk == 1:
-            weight_mult = 1.2 if cf >= 1.00 else 0.7
-            agari_rank_bonus += 0.018 * weight_mult
+            agari_rank_bonus += 0.018 * (1.2 if cf >= 1.00 else 0.7)
         elif ag_rk in [2, 3]:
-            weight_mult = 1.1 if cf >= 1.00 else 0.6
-            agari_rank_bonus += 0.010 * weight_mult
+            agari_rank_bonus += 0.010 * (1.1 if cf >= 1.00 else 0.6)
         elif single_pci is not None and single_pci >= 53.5 and rk <= 4.0 and cf >= 1.00:
             agari_rank_bonus += 0.016
 
@@ -1491,17 +1489,11 @@ def get_horse_real_stats(bamei_str):
     if recent_scores:
         weights = np.linspace(1.0, 2.5, len(recent_scores))
         recent_weighted = float(np.average(recent_scores, weights=weights))
-        
         sorted_career = sorted(career_scores, reverse=True)
-        if len(sorted_career) >= 2:
-            top2_peak = float(np.mean(sorted_career[:2]))
-        else:
-            top2_peak = sorted_career[0]
-            
+        top2_peak = float(np.mean(sorted_career[:2])) if len(sorted_career) >= 2 else sorted_career[0]
         base_power = (recent_weighted * 0.72) + (top2_peak * 0.28)
         if graded_floor_score > base_power:
             base_power = (base_power * 0.45) + (graded_floor_score * 0.55)
-
         power_score = float(np.clip(base_power + agari_rank_bonus, 0.15, 1.25))
     else:
         power_score = 0.50
@@ -1525,6 +1517,7 @@ def get_course_rpci_stats(course_key):
     else: rec_pace = "S_YOIDON"
     return rpci, rpci_type, rec_pace
 
+
 def adjust_pace_times(expected_pace, avg_pace_f, avg_pace_l, avg_req_up):
     if expected_pace in ["S_YOIDON", "S"]: return avg_pace_f + 1.4, avg_pace_l - 1.4, avg_req_up - 1.0
     elif expected_pace == "S_LONSPA": return avg_pace_f + 0.8, avg_pace_l - 0.8, avg_req_up - 0.4
@@ -1541,7 +1534,6 @@ def parse_finished_race_html_odds(
 
     if not result_html or "HorseList" not in result_html:
         return odds_map, weight_map
-
     if "Result_Num" not in result_html and "Pay_Table" not in result_html and "All_Result_Table" not in result_html:
         return odds_map, weight_map
 
@@ -1553,7 +1545,6 @@ def parse_finished_race_html_odds(
                 continue
 
             umaban = 0
-
             if bamei_to_umaban:
                 b_m = re.search(r'<span[^>]*class="[^"]*Horse_Name[^"]*"[^>]*>(.*?)</span>', row, re.IGNORECASE | re.DOTALL)
                 if not b_m:
@@ -1569,17 +1560,6 @@ def parse_finished_race_html_odds(
                     u_val = int(cand_umaban)
                     if 1 <= u_val <= 18:
                         umaban = u_val
-
-            if umaban == 0:
-                u_m = re.search(
-                    r'<td[^>]*class="\s*(?:Num\s+Txt_C|Txt_C\s+Num|Umaban)\s*"[^>]*>(.*?)</td>',
-                    row, re.IGNORECASE | re.DOTALL
-                )
-                if u_m:
-                    u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
-                    if u_str.isdigit():
-                        umaban = int(u_str)
-
             if umaban == 0:
                 continue
 
@@ -1668,10 +1648,7 @@ def fetch_future_race_js_odds(race_id: str, headers: dict) -> tuple[Dict[int, fl
         pass
 
     if len(odds_map) >= 2:
-        if api_status_str == "yoso":
-            return odds_map, "js_yoso"
-        return odds_map, "js_realtime"
-
+        return odds_map, ("js_yoso" if api_status_str == "yoso" else "js_realtime")
     return {}, "none"
 
 
@@ -1689,7 +1666,7 @@ def fetch_hybrid_odds_and_result_weights(
                 html_odds,
                 html_weights,
                 "html_result",
-                f"✅ オッズ自動取得 [終了レース・HTML形式]: レース結果HTMLから確定単勝オッズ（{len(html_odds)}頭）を正確に反映しました。"
+                f"✅ オッズ自動取得 [終了レース・HTML形式]: レース結果HTMLから確定単勝オッズ（{len(html_odds)}頭）を反映しました。"
             )
 
     js_odds, js_mode = fetch_future_race_js_odds(race_id, headers)
@@ -1699,13 +1676,13 @@ def fetch_hybrid_odds_and_result_weights(
                 js_odds,
                 {},
                 "js_yoso",
-                f"ℹ️ オッズ自動取得 [未来レース・JS形式(予想オッズ)]: 馬券発売前のためJavaScript APIから予想オッズ（{len(js_odds)}頭）を反映しました。"
+                f"ℹ️ オッズ自動取得 [未来レース・予想オッズ]: JS APIから予想オッズ（{len(js_odds)}頭）を反映しました。"
             )
         return (
             js_odds,
             {},
             "js_realtime",
-            f"✅ オッズ自動取得 [未来/当日レース・JS形式]: JavaScript動的APIから最新単勝オッズ（{len(js_odds)}頭）を反映しました。"
+            f"✅ オッズ自動取得 [最新オッズ]: JS APIから単勝オッズ（{len(js_odds)}頭）を反映しました。"
         )
 
     inline_odds: Dict[int, float] = {}
@@ -1719,14 +1696,14 @@ def fetch_hybrid_odds_and_result_weights(
             inline_odds,
             {},
             "html_inline",
-            f"✅ オッズ自動取得 [出馬表HTML]: 出馬表ページから単勝オッズ（{len(inline_odds)}頭）を反映しました。"
+            f"✅ オッズ自動取得 [出馬表HTML]: 単勝オッズ（{len(inline_odds)}頭）を反映しました。"
         )
 
     return (
         {},
         {},
         "manual_required",
-        "⚠️ オッズ未発売（未算出）のため初期値(10.0倍)をセットしました。必要に応じて手動で入力してください。"
+        "⚠️ オッズ未発売のため初期値(10.0倍)をセットしました。必要に応じて手動で入力してください。"
     )
 
 
@@ -1751,12 +1728,10 @@ def infer_auto_condition_override(
 
     if change_val <= -14.0 or (change_val <= -10.0 and weight_val < 440.0):
         return "0.88", f"極端な馬体減({int(change_val)}kg)・深刻な輸送細化"
-
     if -12.0 <= change_val <= -10.0:
         if weight_val >= 500.0 and power_score >= 0.65:
             return "1.00", f"大型馬の絞り込み({int(change_val)}kg)・許容範囲"
         return "0.94", f"馬体減({int(change_val)}kg)・やや細化注意"
-
     if -8.0 <= change_val <= -4.0:
         if best_weight and abs(weight_val - best_weight) <= 3.0:
             return "1.03", f"ベスト体重へ引き締め({int(change_val)}kg)・好仕上がり"
@@ -1765,12 +1740,10 @@ def infer_auto_condition_override(
         if change_val == -8.0 and weight_val < 460.0:
             return "0.97", f"やや馬体減({int(change_val)}kg)・微減点のみ"
         return "1.00", f"本番仕様の引き締め({int(change_val)}kg)・標準"
-
     if -2.0 <= change_val <= 2.0:
         if power_score >= 0.72 and zenso <= 3.0 and kaisuu >= 2:
             return "1.04", f"好調維持({change_val:+.0f}kg)・好仕上がり"
         return "1.00", "馬体安定（標準）"
-
     if 4.0 <= change_val <= 10.0:
         if best_weight and abs(weight_val - best_weight) <= 3.0:
             return "1.03", f"ベスト体重合致({change_val:+.0f}kg)・充実"
@@ -1779,33 +1752,23 @@ def infer_auto_condition_override(
         if change_val >= 8.0 and zenso >= 8.0 and power_score < 0.52:
             return "0.95", f"凡走後の馬体増({change_val:+.0f}kg)・やや太め注意"
         return "1.00", "標準範囲内"
-
     if change_val >= 12.0:
         if power_score >= 0.68 and zenso <= 3.0:
             return "1.02", f"実績馬の馬体増({change_val:+.0f}kg)・成長分"
         return "0.94", f"大幅馬体増({change_val:+.0f}kg)・太め残り注意"
-
     return "1.00", "標準"
 
-def get_course_rpci_stats_from_val(rpci: float):
-    rpci_type = get_pci_label(rpci)
-    if rpci < 48.0: rec_pace = "H_MAEKUZURE"
-    elif rpci < 49.8: rec_pace = "M_LONSPA"
-    elif rpci <= 52.0: rec_pace = "M_JIRIKI"
-    elif rpci <= 53.2: rec_pace = "S_LONSPA"
-    else: rec_pace = "S_YOIDON"
-    return rpci, rpci_type, rec_pace
 
-def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[str, str, str]:
+def auto_detect_expected_pace(
+    horses_data: list, course_rpci: float, track_condition: str = "良"
+) -> tuple[str, str, str]:
+    """
+    逃げ・先行馬の頭数に加え、『上位人気5頭の脚質分布（差し・追込偏重による牽制スロー）』や『雨・道悪』も加味して展開を自動予測する
+    """
     if not horses_data or len(horses_data) < 2:
         return "M_JIRIKI", "manual_required", "⚠️ 出走馬データが不足しているため標準ペース（ミドル①）にセットしました。"
 
     total_h = len(horses_data)
-    with_history = sum(1 for h in horses_data if h.get("shussou_kaisuu", 0) > 0)
-    if with_history < max(2, total_h // 3):
-        _, _, rec_p = get_course_rpci_stats_from_val(course_rpci)
-        return rec_p, "fallback_course", f"ℹ️ 過去走データが少ないため、舞台RPCI({course_rpci})基準で自動セットしました。"
-
     nige_cnt = sum(1 for h in horses_data if int(round(h.get("kyakushitsu", 2))) == 1)
     senkou_cnt = sum(1 for h in horses_data if int(round(h.get("kyakushitsu", 2))) == 2)
     makuri_cnt = sum(1 for h in horses_data if h.get("makuri_flag", False))
@@ -1813,9 +1776,20 @@ def auto_detect_expected_pace(horses_data: list, course_rpci: float) -> tuple[st
     front_ratio = (nige_cnt + senkou_cnt) / float(total_h)
     avg_pci = float(np.mean([h.get("pci", 50.0) for h in horses_data]))
 
+    # 上位人気5頭のうち何頭が差し・追込（kyakushitsu >= 3）かをチェック
+    valid_odds_h = [h for h in horses_data if h.get("odds", 0) > 1.0]
+    fav5 = sorted(valid_odds_h, key=lambda x: x["odds"])[:5] if len(valid_odds_h) >= 5 else horses_data[:5]
+    fav5_closers = sum(1 for h in fav5 if int(round(h.get("kyakushitsu", 2))) >= 3)
+
     if nige_cnt >= 3 or (nige_cnt >= 2 and (front_ratio >= 0.48 or fast_early_cnt >= 3)) or (course_rpci < 48.0 and nige_cnt >= 2):
         pace = "H_MAEKUZURE"
         msg = f"✅ 展開自動判定: 逃げ{nige_cnt}頭・先行{senkou_cnt}頭（テン速馬{fast_early_cnt}頭）で先行激化 ➔ 『ハイ① 前崩れ消耗戦』を自動セット"
+    elif track_condition in ["重", "不"] and nige_cnt >= 1:
+        pace = "M_LONSPA"
+        msg = f"✅ 展開自動判定: 道悪（{track_condition}馬場）×先行争い ➔ 上がりがかかる『ミドル② タフ持続ロンスパ戦』を自動セット"
+    elif fav5_closers >= 4 and nige_cnt <= 1:
+        pace = "S_LONSPA" if makuri_cnt >= 1 else "S_YOIDON"
+        msg = f"✅ 展開自動判定: 上位人気5頭中{fav5_closers}頭が差し・追込で後方牽制濃厚（前の伏兵残り警戒！）➔ 『{pace}』を自動セット"
     elif (nige_cnt >= 2 and makuri_cnt >= 2) or (front_ratio >= 0.36 and avg_pci < 50.3) or (48.0 <= course_rpci < 49.8 and nige_cnt >= 1):
         pace = "M_LONSPA"
         msg = f"✅ 展開自動判定: 逃げ{nige_cnt}頭・先行{senkou_cnt}頭 / マクリ実績{makuri_cnt}頭 ➔ 『ミドル② タフ持続ロンスパ戦』を自動セット"
@@ -1885,14 +1859,12 @@ def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]
     dt = extract_target_race_date(shutuba_html)
     if dt is not None:
         return dt.weekday()
-
     act_m = re.search(r'<dd[^>]*class="[^"]*Active[^"]*"[^>]*>(.*?)</dd>', shutuba_html, re.IGNORECASE | re.DOTALL)
     if act_m:
         act_txt = act_m.group(1)
         if "土" in act_txt: return 5
         if "日" in act_txt: return 6
         if "月" in act_txt: return 0
-
     if day_num == 1:
         return 5
     return None
@@ -1901,12 +1873,9 @@ def detect_target_race_weekday(shutuba_html: str, day_num: int) -> Optional[int]
 def auto_detect_track_bias(
     race_id: str, target_track_type: str, shutuba_html: str, rail_code: str = "", rail_msg: str = "", start_ts: float = 0.0
 ) -> tuple[str, str, str, str]:
-    """
-    高速・軽量版バイアス判定: 最大3レースまでの短時間チェックに制限し、全体経過時間が8秒を超えたら即スキップする
-    """
     try:
         if len(race_id) < 12 or not race_id.isdigit():
-            return "フラット", "中", "manual_required", "⚠️ レースID形式から過去レースを参照できないため、トラックバイアスは手動で設定してください。"
+            return "フラット", "中", "manual_required", "⚠️ トラックバイアスは手動で設定してください。"
 
         prefix_8 = race_id[:8]
         day_num = int(race_id[8:10])
@@ -1924,7 +1893,6 @@ def auto_detect_track_bias(
         sampled_same_day = 0
         sampled_prev_day = 0
 
-        # 当日の直近レースを最大3鞍まで高速チェック
         if race_num >= 2:
             checked_cnt = 0
             for r_no in range(race_num - 1, 0, -1):
@@ -1944,7 +1912,6 @@ def auto_detect_track_bias(
                     collected_top3.extend(parsed)
                     sampled_same_day += 1
 
-        # 当日結果がまだない日曜・月曜の場合、前日のメイン付近（9R〜12R）から最大3鞍だけチェック
         if sampled_same_day == 0 and day_num >= 2 and not is_saturday_race:
             prev_day = day_num - 1
             for r_no in [12, 11, 10, 9]:
@@ -1977,17 +1944,13 @@ def auto_detect_track_bias(
             )
 
         total_horses = len(collected_top3)
-        inner_cnt = sum(1 for x in collected_top3 if x["waku"] <= 4)
-        outer_cnt = sum(1 for x in collected_top3 if x["waku"] >= 5)
-        inner_rate = inner_cnt / float(total_horses)
-        outer_rate = outer_cnt / float(total_horses)
+        inner_rate = sum(1 for x in collected_top3 if x["waku"] <= 4) / float(total_horses)
+        outer_rate = sum(1 for x in collected_top3 if x["waku"] >= 5) / float(total_horses)
 
         valid_pass = [x["last_corner"] for x in collected_top3 if x["last_corner"] > 0]
         if valid_pass:
-            front_cnt = sum(1 for p in valid_pass if p <= 4)
-            closer_cnt = sum(1 for p in valid_pass if p >= 6)
-            front_rate = front_cnt / float(len(valid_pass))
-            closer_rate = closer_cnt / float(len(valid_pass))
+            front_rate = sum(1 for p in valid_pass if p <= 4) / float(len(valid_pass))
+            closer_rate = sum(1 for p in valid_pass if p >= 6) / float(len(valid_pass))
         else:
             front_rate, closer_rate = 0.5, 0.5
 
@@ -1996,14 +1959,10 @@ def auto_detect_track_bias(
 
         if inner_rate >= 0.58 and front_rate >= 0.55:
             detected_bias = "イン前有利 (1〜4枠・先行)"
-            if inner_rate >= 0.70 and front_rate >= 0.65: detected_strength = "極端"
-            elif inner_rate >= 0.63 or front_rate >= 0.60: detected_strength = "中"
-            else: detected_strength = "弱"
+            detected_strength = "極端" if (inner_rate >= 0.70 and front_rate >= 0.65) else ("中" if (inner_rate >= 0.63 or front_rate >= 0.60) else "弱")
         elif outer_rate >= 0.58 and closer_rate >= 0.50:
             detected_bias = "外差し有利 (5〜8枠・差し追込)"
-            if outer_rate >= 0.70 and closer_rate >= 0.60: detected_strength = "極端"
-            elif outer_rate >= 0.63 or closer_rate >= 0.55: detected_strength = "中"
-            else: detected_strength = "弱"
+            detected_strength = "極端" if (outer_rate >= 0.70 and closer_rate >= 0.60) else ("中" if (outer_rate >= 0.63 or closer_rate >= 0.55) else "弱")
         elif front_rate >= 0.65:
             detected_bias = "前残り (逃げ・先行有利)"
             detected_strength = "極端" if front_rate >= 0.78 else "中"
@@ -2024,12 +1983,8 @@ def auto_detect_track_bias(
             f"『{detected_bias}（強度:{detected_strength}）』を自動セットしました。{rail_suffix}"
         )
         return detected_bias, detected_strength, "auto_detected", summary_msg
-
     except Exception:
-        return (
-            "フラット", "中", "manual_required",
-            "⚠️ 過去レース結果の取得をスキップしました。トラックバイアスは手動で設定してください。"
-        )
+        return "フラット", "中", "manual_required", "⚠️ トラックバイアスは手動で設定してください。"
 
 
 class HorseData(BaseModel):
@@ -2040,7 +1995,7 @@ class HorseData(BaseModel):
     odds: float = 0.0
     kinryou: float
     bataijuu: float = 480.0
-    weight_change: float = 0.0  
+    weight_change: float = 0.0
     condition_override: str = "1.00"
     condition_reason: Optional[str] = ""
     training_rank: Optional[str] = "B"
@@ -2048,10 +2003,11 @@ class HorseData(BaseModel):
     rotation_label: Optional[str] = ""
     zenso_chakujun: float = 8.0
     avg_agari: float = 35.0
-    kyakushitsu: float = 2.0  
+    kyakushitsu: float = 2.0
     shussou_kaisuu: float = 0.0
     pci: Optional[float] = 50.0
     pci_type: Optional[str] = "B"
+
 
 class RaceRequest(BaseModel):
     race_id: str
@@ -2062,8 +2018,8 @@ class RaceRequest(BaseModel):
     track_condition: str
     expected_pace: str = "M_JIRIKI"
     track_bias: str = "フラット"
-    bias_strength: str = "中" 
-    cushion_value: float = 9.5 
+    bias_strength: str = "中"
+    cushion_value: float = 9.5
 
 
 @app.get("/")
@@ -2080,8 +2036,6 @@ def fetch_race(race_id: str):
 
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     html = None
-    is_shutuba = False
-    
     for attempt in range(2):
         html_cand = cached_get_html(
             f"https://race.netkeiba.com/race/shutuba.html?race_id={clean_race_id}",
@@ -2089,11 +2043,10 @@ def fetch_race(race_id: str):
         )
         if html_cand and ("HorseList" in html_cand or "馬番" in html_cand):
             html = html_cand
-            is_shutuba = True
             break
         time.sleep(0.3)
 
-    if not is_shutuba or not html:
+    if not html:
         return {"status": "error", "message": "出馬表データが見つかりませんでした。レースIDを確認してください。"}
 
     try:
@@ -2120,9 +2073,7 @@ def fetch_race(race_id: str):
         m_cond = re.search(r'(?:芝|ダート|馬場)\s*:\s*(良|稍重|稍|重|不良|不)', html)
         if m_cond:
             c_val = m_cond.group(1)
-            if c_val == "稍重": c_val = "稍"
-            elif c_val == "不良": c_val = "不"
-            track_condition = c_val
+            track_condition = "稍" if c_val == "稍重" else ("不" if c_val == "不良" else c_val)
 
         horse_blocks = re.findall(r'<tr[^>]*class="[^"]*HorseList[^"]*"[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
 
@@ -2130,12 +2081,10 @@ def fetch_race(race_id: str):
         bamei_list: List[str] = []
         for block in horse_blocks:
             try:
-                u_num = 0
                 u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
-                if u_m:
-                    u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
-                    if u_str.isdigit(): u_num = int(u_str)
-                if u_num == 0: continue
+                u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip() if u_m else ""
+                if not u_str.isdigit(): continue
+                u_num = int(u_str)
                 b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
                 if not b_m: b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
                 if b_m:
@@ -2147,49 +2096,57 @@ def fetch_race(race_id: str):
                 continue
 
         past_merged_ok, merged_cnt = fetch_and_merge_shutuba_past(clean_race_id, headers, bamei_list)
-
         hybrid_odds_map, result_weight_map, odds_status, odds_msg = fetch_hybrid_odds_and_result_weights(
             clean_race_id, html, headers, bamei_to_umaban
         )
 
-        horses_data = []
-        
-        def get_auto_kyakushitsu(bamei_str):
+        # 近2走の重みを高めた脚質自動判定（距離延長時の先行シフト対応）
+        def get_auto_kyakushitsu(bamei_str, target_dist):
             try:
                 records = get_active_horse_records(bamei_str)
                 if not records: return 2.0
-                last_corners = []
-                for r in records[-5:]:
+                recent_recs = records[-5:]
+                weighted_pos = []
+                weights = []
+                prev_dist = target_dist
+                for idx_r, r in enumerate(recent_recs):
                     passing = str(r.get('passing', ''))
                     if passing and passing != '-':
-                        try: last_corners.append(int(passing.split('-')[-1]))
-                        except: pass
-                if not last_corners: return 2.0
-                avg_pos = np.mean(last_corners)
-                if avg_pos <= 2.5: return 1.0
-                elif avg_pos <= 6.5: return 2.0
+                        nums = [int(x) for x in passing.split('-') if x.strip().isdigit()]
+                        if nums:
+                            pos_val = nums[0] * 0.4 + nums[-1] * 0.6
+                            w = 2.2 if idx_r >= len(recent_recs) - 2 else 1.0
+                            weighted_pos.append(pos_val)
+                            weights.append(w)
+                    if idx_r == len(recent_recs) - 1:
+                        m_d = re.search(r'(\d{3,4})', str(r.get('course', '')))
+                        if m_d: prev_dist = int(m_d.group(1))
+                if not weighted_pos: return 2.0
+                avg_pos = float(np.average(weighted_pos, weights=weights))
+                # 前走から300m以上の距離延長なら追走が楽になり約1.0頭分前へ位置取りシフト
+                if target_dist - prev_dist >= 300:
+                    avg_pos = max(1.0, avg_pos - 1.0)
+                if avg_pos <= 2.4: return 1.0
+                elif avg_pos <= 6.2: return 2.0
                 elif avg_pos <= 10.5: return 3.0
                 else: return 4.0
-            except: return 2.0
+            except:
+                return 2.0
 
+        horses_data = []
         any_weight_announced = False
-        tataki2_count = 0
 
         for block in horse_blocks:
             try:
-                umaban = 0
                 u_m = re.search(r'<td[^>]*class="[^"]*(?:Umaban)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
-                if u_m:
-                    u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip()
-                    if u_str.isdigit(): umaban = int(u_str)
-                if umaban == 0: continue
+                u_str = re.sub(r'<[^>]*>', '', u_m.group(1)).strip() if u_m else ""
+                if not u_str.isdigit(): continue
+                umaban = int(u_str)
 
-                wakuban = 0
                 waku_m = re.search(r'<td[^>]*class="[^"]*(?:Waku)[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
-                if waku_m:
-                    waku_str = re.sub(r'<[^>]*>', '', waku_m.group(1)).strip()
-                    if waku_str.isdigit(): wakuban = int(waku_str)
-                
+                waku_str = re.sub(r'<[^>]*>', '', waku_m.group(1)).strip() if waku_m else ""
+                wakuban = int(waku_str) if waku_str.isdigit() else 0
+
                 bamei = f"馬番{umaban}"
                 b_m = re.search(r'<span[^>]*class="[^"]*HorseName[^"]*"[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
                 if not b_m: b_m = re.search(r'<a[^>]*href="[^"]*horse/\d+[^"]*"[^>]*>(.*?)</a>', block, re.IGNORECASE | re.DOTALL)
@@ -2210,36 +2167,28 @@ def fetch_race(race_id: str):
                     try: kinryou = float(kin_matches[0])
                     except: pass
 
-                odds = 10.0
-                if umaban in hybrid_odds_map:
-                    odds = hybrid_odds_map[umaban]
-                else:
+                odds = hybrid_odds_map.get(umaban, 10.0)
+                if umaban not in hybrid_odds_map:
                     o_m = re.search(r'<span[^>]*id="odds[^>]*>(.*?)</span>', block, re.IGNORECASE | re.DOTALL)
                     if o_m:
                         o_str = re.sub(r'<[^>]*>', '', o_m.group(1)).strip().replace(',', '')
                         try:
                             val_o = float(o_str)
-                            if val_o >= 1.0:
-                                odds = val_o
+                            if val_o >= 1.0: odds = val_o
                         except:
                             pass
 
-                weight_val = 480.0
-                change_val = 0.0
-                weight_announced = False
+                weight_val, change_val, weight_announced = 480.0, 0.0, False
                 w_m = re.search(r'<td[^>]*class="[^"]*Weight[^"]*"[^>]*>(.*?)</td>', block, re.IGNORECASE | re.DOTALL)
                 if w_m:
                     w_str = re.sub(r'<[^>]*>', '', w_m.group(1)).strip()
                     m_weight = re.search(r'(\d{3})\s*\(([+-]?\d+)\)', w_str)
                     if m_weight:
-                        weight_val = float(m_weight.group(1))
-                        change_val = float(m_weight.group(2))
+                        weight_val, change_val = float(m_weight.group(1)), float(m_weight.group(2))
                         weight_announced = True
                         any_weight_announced = True
-                    else:
-                        m_weight2 = re.search(r'(\d{3})', w_str)
-                        if m_weight2:
-                            weight_val = float(m_weight2.group(1))
+                    elif (m_w2 := re.search(r'(\d{3})', w_str)):
+                        weight_val = float(m_w2.group(1))
 
                 if not weight_announced and umaban in result_weight_map:
                     weight_val, change_val = result_weight_map[umaban]
@@ -2253,44 +2202,32 @@ def fetch_race(race_id: str):
                 auto_cond_code, auto_cond_reason = infer_auto_condition_override(
                     bamei, weight_val, change_val, weight_announced, zenso, power_score, kaisuu
                 )
-
+                default_cushion = 8.6 if track_condition in ["稍", "重", "不"] else 9.5
                 _, _, ped_summary = evaluate_pedigree_and_distance_aptitude(
-                    bamei, track_type, distance, track_condition, 9.5
+                    bamei, track_type, distance, track_condition, default_cushion
                 )
-
                 rot_mult, rot_label = evaluate_rotation_aptitude(
                     bamei, target_race_date, power_score, distance
                 )
-                if "叩き2走目" in rot_label:
-                    tataki2_count += 1
-
                 _, gear_label = evaluate_lap_gear_aptitude(
-                    bamei, track_type, distance, 9.5, track_condition, "M_JIRIKI"
+                    bamei, track_type, distance, default_cushion, track_condition, "M_JIRIKI"
                 )
 
-                reason_parts = [auto_cond_reason]
-                if rot_label:
-                    reason_parts.append(rot_label)
-                if gear_label:
-                    reason_parts.append(gear_label)
-                if ped_summary:
-                    reason_parts.append(ped_summary)
-                combined_reason = " / ".join(reason_parts)
-
+                reason_parts = [x for x in [auto_cond_reason, rot_label, gear_label, ped_summary] if x]
                 history_details = build_horse_history_details(bamei, place_dict)
 
                 horses_data.append({
                     "wakuban": wakuban,
                     "umaban": umaban, "bamei": bamei, "kishu": kishu,
-                    "odds": odds, "kinryou": kinryou, 
-                    "bataijuu": weight_val, "weight_change": change_val, 
+                    "odds": odds, "kinryou": kinryou,
+                    "bataijuu": weight_val, "weight_change": change_val,
                     "condition_override": auto_cond_code,
-                    "condition_reason": combined_reason,
+                    "condition_reason": " / ".join(reason_parts),
                     "training_rank": "B",
                     "rotation_mult": round(rot_mult, 3),
                     "rotation_label": rot_label,
                     "zenso_chakujun": zenso, "avg_agari": agari,
-                    "kyakushitsu": get_auto_kyakushitsu(bamei),
+                    "kyakushitsu": get_auto_kyakushitsu(bamei, distance),
                     "shussou_kaisuu": kaisuu,
                     "pci": h_pci, "pci_type": h_pci_type,
                     "makuri_flag": makuri_flag,
@@ -2298,7 +2235,8 @@ def fetch_race(race_id: str):
                     "power_score": round(power_score, 3),
                     "history_details": history_details
                 })
-            except: continue
+            except:
+                continue
 
         horses_data = sorted(horses_data, key=lambda x: x['umaban'])
         total_h = len(horses_data)
@@ -2306,13 +2244,12 @@ def fetch_race(race_id: str):
             if not h["wakuban"] or h["wakuban"] <= 0:
                 h["wakuban"] = calc_jra_wakuban(h["umaban"], total_h)
 
+        valid_odds_h = [h for h in horses_data if h.get("odds", 0) > 1.0]
+        fav5 = sorted(valid_odds_h, key=lambda x: x["odds"])[:5] if len(valid_odds_h) >= 5 else horses_data[:5]
+        fav_closer_skew = sum(1 for h in fav5 if int(round(h.get("kyakushitsu", 2))) >= 3) >= 4
+
         early_info_preview = [
-            {
-                "umaban": h["umaban"],
-                "wakuban": h["wakuban"],
-                "kyakushitsu": int(round(h["kyakushitsu"])),
-                "early_3f": h.get("early_3f_sec", 35.8)
-            }
+            {"umaban": h["umaban"], "wakuban": h["wakuban"], "kyakushitsu": int(round(h["kyakushitsu"])), "early_3f": h.get("early_3f_sec", 35.8)}
             for h in horses_data
         ]
         by_power = sorted(horses_data, key=lambda x: x.get("power_score", 0.5), reverse=True)
@@ -2320,8 +2257,8 @@ def fetch_race(race_id: str):
         for h in horses_data:
             p_rank = next((i + 1 for i, x in enumerate(by_power) if x["umaban"] == h["umaban"]), 99)
             _, preview_badges, _ = evaluate_box_in_and_lead_risk(
-                h["wakuban"], h["umaban"], h["kyakushitsu"], h["odds"],
-                p_rank, p_gap, total_h, early_info_preview, track_type, distance, 9.5
+                h["wakuban"], h["umaban"], h["kyakushitsu"], h["odds"], h["kinryou"],
+                p_rank, p_gap, total_h, early_info_preview, track_type, distance, 9.5, fav_closer_skew=fav_closer_skew
             )
             if preview_badges:
                 h["condition_reason"] = f"{' '.join(preview_badges)} / {h['condition_reason']}"
@@ -2333,60 +2270,47 @@ def fetch_race(race_id: str):
         reference_benchmarks = fetch_reference_race_benchmarks(
             clean_race_id, headers, c_stats, track_type, distance, race_name=race_name, start_ts=start_ts
         )
-
-        auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci)
+        auto_pace, pace_status, pace_msg = auto_detect_expected_pace(horses_data, rpci, track_condition=track_condition)
         auto_bias, auto_strength, bias_status, bias_msg = auto_detect_track_bias(
             clean_race_id, track_type, html, rail_code=rail_code, rail_msg=rail_msg, start_ts=start_ts
         )
 
         elapsed_sec = round(time.time() - start_ts, 1)
-        db_merge_note = f" [5走柱・ラップギア・包まれ解析:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB＋血統辞書使用 / {elapsed_sec}秒]"
-        if any_weight_announced:
-            weight_status = "auto_detected"
-            weight_msg = f"✅ 馬体重・血統・ローテ・包まれリスク印を自動セットしました。{db_merge_note}"
-        else:
-            weight_status = "manual_required"
-            weight_msg = f"ℹ️ 血統・ローテ・包まれリスク印を自動セットしました（馬体重は未発表）。{db_merge_note}"
+        db_merge_note = f" [5走柱・道悪/展開解析:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB使用 / {elapsed_sec}秒]"
+        weight_status = "auto_detected" if any_weight_announced else "manual_required"
+        weight_msg = f"✅ 馬体重・血統・ローテ・包まれ/前残り印を自動セットしました。{db_merge_note}"
 
         return {
             "status": "success", "race_name": race_name, "place_name": place_name,
             "course_type": track_type, "distance": distance,
             "weather": weather, "track_condition": track_condition,
-            "course_rail_code": rail_code,
-            "course_rail_message": rail_msg,
+            "course_rail_code": rail_code, "course_rail_message": rail_msg,
             "rpci": rpci, "rpci_type": rpci_type,
             "recommended_pace": auto_pace,
-            "auto_track_bias": auto_bias,
-            "auto_bias_strength": auto_strength,
+            "auto_track_bias": auto_bias, "auto_bias_strength": auto_strength,
             "reference_benchmarks": reference_benchmarks,
             "auto_status": {
-                "odds_status": odds_status,
-                "odds_message": odds_msg,
-                "pace_status": pace_status,
-                "pace_message": pace_msg,
-                "bias_status": bias_status,
-                "bias_message": bias_msg,
-                "weight_status": weight_status,
-                "weight_message": weight_msg
+                "odds_status": odds_status, "odds_message": odds_msg,
+                "pace_status": pace_status, "pace_message": pace_msg,
+                "bias_status": bias_status, "bias_message": bias_msg,
+                "weight_status": weight_status, "weight_message": weight_msg
             },
             "horses": horses_data
         }
-
     except Exception as e:
         return {"status": "error", "message": f"パース処理エラー: {str(e)}"}
 
 
 def get_time_limit_multiplier(horse_name, course_type, current_distance, expected_standard_time, cushion_val, track_cond):
-    is_rough_track = (track_cond in ["稍", "重", "不"]) or (cushion_val < 8.5)
+    is_rough_track = (track_cond in ["稍", "重", "不"]) or (cushion_val < 8.9)
     if is_rough_track or current_distance >= 2500:
-        return 1.00 
+        return 1.00
 
     h_records = get_active_horse_records(horse_name)
     if not h_records:
-        return 1.00 
+        return 1.00
 
     total_runs = len(h_records)
-
     has_sharp_agari = False
     for r in h_records[-5:]:
         try:
@@ -2399,9 +2323,7 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
         except:
             continue
 
-    best_diff_per_halon = None
     cur_halons = current_distance / 200.0
-    
     same_dist_diffs = []
     adjacent_diffs = []
 
@@ -2413,20 +2335,15 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
             continue
 
         m = re.search(r'(\d{3,4})', r_c)
-        if not m:
-            continue
+        if not m: continue
         dist = int(m.group(1))
 
         single_pci = calc_single_pci(r_c, r.get('time', ''), r.get('up', ''))
-        slow_pace_allowance = 0.0
-        if single_pci is not None and single_pci >= 51.5:
-            slow_pace_allowance = min(1.2, (single_pci - 51.0) * 0.22)
-
+        slow_pace_allowance = min(1.2, (single_pci - 51.0) * 0.22) if (single_pci is not None and single_pci >= 51.5) else 0.0
         effective_t_sec = t_sec - slow_pace_allowance
 
         if dist == current_distance:
-            diff_h = (effective_t_sec - expected_standard_time) / cur_halons
-            same_dist_diffs.append(diff_h)
+            same_dist_diffs.append((effective_t_sec - expected_standard_time) / cur_halons)
         elif 0 < abs(dist - current_distance) <= 400:
             adj_stats = course_history_db.get(r_c, {})
             adj_std = adj_stats.get('standard_time')
@@ -2439,62 +2356,40 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
                 adj_diff = (projected_time - expected_standard_time) / cur_halons
             adjacent_diffs.append(adj_diff)
 
-    if same_dist_diffs:
-        best_diff_per_halon = min(same_dist_diffs)
-    elif adjacent_diffs:
-        best_diff_per_halon = min(adjacent_diffs)
-
-    if best_diff_per_halon is None:
-        return 1.00 
+    best_diff = min(same_dist_diffs) if same_dist_diffs else (min(adjacent_diffs) if adjacent_diffs else None)
+    if best_diff is None:
+        return 1.00
 
     is_high_speed = (cushion_val >= 9.5)
-
-    if best_diff_per_halon <= -0.02:
-        mult = 1.02 if is_high_speed else 1.01
-    elif best_diff_per_halon <= 0.06:
-        mult = 1.00 
-    elif best_diff_per_halon <= 0.11:
-        mult = 0.97 if is_high_speed else 0.99 
-    elif best_diff_per_halon <= 0.16:
-        mult = 0.94 if is_high_speed else 0.97 
-    else:
-        mult = 0.92 if is_high_speed else 0.95 
+    if best_diff <= -0.02: mult = 1.02 if is_high_speed else 1.01
+    elif best_diff <= 0.06: mult = 1.00
+    elif best_diff <= 0.11: mult = 0.97 if is_high_speed else 0.99
+    elif best_diff <= 0.16: mult = 0.94 if is_high_speed else 0.97
+    else: mult = 0.92 if is_high_speed else 0.95
 
     if total_runs <= 4 or has_sharp_agari:
         mult = max(mult, 0.97)
-
     return round(mult, 3)
 
 
 def calculate_stage1_pure_score(
     raw_lgb_pred_neutral: float, horse: HorseData, power_score: float, time_diff_base: float, stage1_ped_mult: float = 1.0
 ) -> float:
-    if horse.odds > 1.0:
-        market_prob = min(0.55, 0.80 / float(horse.odds))
-    else:
-        market_prob = 0.08
-
-    agari_factor = 1.0
-    if time_diff_base <= -0.3: agari_factor = 1.035
-    elif time_diff_base <= 0.0: agari_factor = 1.015
-    elif time_diff_base >= 0.6: agari_factor = 0.965
-
+    market_prob = min(0.55, 0.80 / float(horse.odds)) if horse.odds > 1.0 else 0.08
+    agari_factor = 1.035 if time_diff_base <= -0.3 else (1.015 if time_diff_base <= 0.0 else (0.965 if time_diff_base >= 0.6 else 1.0))
     pure_ability = ((raw_lgb_pred_neutral * 0.36) + (power_score * 0.46) + (market_prob * 0.18)) * agari_factor * stage1_ped_mult
     return float(pure_ability)
 
 
 def calculate_comprehensive_score(
-    raw_lgb_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff, 
-    expected_pace, track_bias, bias_strength, cushion_value, course_rpci, 
+    raw_lgb_pred, horse, power_score, makuri_flag, h_pci, h_pci_type, time_diff,
+    expected_pace, track_bias, bias_strength, cushion_value, course_rpci,
     time_limit_mult, stage2_ped_mult: float = 1.0, rotation_mult: float = 1.0,
     training_mult: float = 1.0, stage1_rank: int = 99, total_horses: int = 16,
     track_condition: str = "良", tactical_mult: float = 1.0, gear_mult: float = 1.0,
-    jockey_mult: float = 1.0
+    jockey_mult: float = 1.0, distance: int = 2000
 ):
-    if horse.odds > 1.0:
-        market_prob = min(0.55, 0.80 / float(horse.odds))
-    else: market_prob = 0.08
-
+    market_prob = min(0.55, 0.80 / float(horse.odds)) if horse.odds > 1.0 else 0.08
     if expected_pace in ["M_JIRIKI", "M"]:
         base_ability = (raw_lgb_pred * 0.38) + (power_score * 0.42) + (market_prob * 0.20)
     else:
@@ -2502,28 +2397,32 @@ def calculate_comprehensive_score(
 
     kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
+    is_wet_or_tough = (track_condition in ["稍", "重", "不"]) or (cushion_value <= 8.9)
     is_fast_cushion = (cushion_value >= 9.5 and track_condition == "良")
     is_elite_jiriki = (stage1_rank <= 3) or (power_score >= 0.78)
 
     pace_mult = 1.0
     if expected_pace in ["S_YOIDON", "S"]:
-        if h_pci_type == "C": pace_mult *= 1.10
-        elif h_pci_type == "B": pace_mult *= 1.00
-        else: pace_mult *= 0.93
-        if kyaku == 1: pace_mult *= 1.06
+        if is_wet_or_tough:
+            # 道悪のスローは瞬発力(PCI:C)ではなく先行・持続型(PCI:B/A)が粘り込む
+            pace_mult *= 1.06 if h_pci_type in ["A", "B"] else 0.97
+        else:
+            pace_mult *= 1.10 if h_pci_type == "C" else (1.00 if h_pci_type == "B" else 0.93)
+        if kyaku == 1: pace_mult *= 1.07
         elif kyaku == 2: pace_mult *= 1.08
-        elif kyaku == 3: pace_mult *= 1.04
+        elif kyaku == 3: pace_mult *= 1.03
         elif kyaku == 4: pace_mult *= 0.90
-        if time_diff <= -0.3: pace_mult *= 1.06
-        elif time_diff <= 0.1: pace_mult *= 1.03
-        elif time_diff >= 0.6: pace_mult *= 0.95
+        if not is_wet_or_tough:
+            if time_diff <= -0.3: pace_mult *= 1.06
+            elif time_diff <= 0.1: pace_mult *= 1.03
+            elif time_diff >= 0.6: pace_mult *= 0.95
 
     elif expected_pace == "S_LONSPA":
-        if 49.5 <= h_pci <= 54.5: pace_mult *= 1.09
-        elif h_pci_type == "C": pace_mult *= 1.04
-        else: pace_mult *= 0.95
-        if kyaku == 1: pace_mult *= 0.96
-        elif kyaku == 2: pace_mult *= 1.06
+        if 49.0 <= h_pci <= 54.5: pace_mult *= 1.09
+        elif h_pci_type == "C": pace_mult *= 1.03
+        else: pace_mult *= 0.97
+        if kyaku == 1: pace_mult *= 0.98
+        elif kyaku == 2: pace_mult *= 1.07
         elif kyaku == 3: pace_mult *= 1.08
         elif kyaku == 4: pace_mult *= 0.96
         if makuri_flag: pace_mult *= 1.06
@@ -2532,95 +2431,80 @@ def calculate_comprehensive_score(
             elif time_diff >= 0.45: pace_mult *= 0.96
 
     elif expected_pace in ["M_JIRIKI", "M"]:
-        if h_pci_type == "B": pace_mult *= 1.05
-        elif h_pci_type == "C" and is_fast_cushion: pace_mult *= 1.04
-        else: pace_mult *= 0.99
+        if is_wet_or_tough:
+            if h_pci <= 50.5: pace_mult *= 1.06
+            elif h_pci_type == "C": pace_mult *= 0.96
+        else:
+            if h_pci_type == "B": pace_mult *= 1.05
+            elif h_pci_type == "C" and is_fast_cushion: pace_mult *= 1.04
+            else: pace_mult *= 0.99
 
         if kyaku == 1: pace_mult *= 0.97
         elif kyaku == 2: pace_mult *= 1.06
-        elif kyaku == 3: pace_mult *= 1.06 if is_fast_cushion else 1.04
-        elif kyaku == 4: pace_mult *= 0.98 if (is_fast_cushion and is_elite_jiriki) else 0.94
+        elif kyaku == 3: pace_mult *= 1.06
+        elif kyaku == 4: pace_mult *= 0.98 if is_elite_jiriki else 0.94
 
         if power_score >= 0.72: pace_mult *= 1.05
-
         if is_fast_cushion:
             if time_diff <= -0.30: pace_mult *= 1.055
             elif time_diff <= -0.05: pace_mult *= 1.025
             elif time_diff >= 0.35: pace_mult *= 0.950
 
     elif expected_pace == "M_LONSPA":
-        if 46.5 <= h_pci <= 51.5: pace_mult *= 1.08
-        elif h_pci_type == "A": pace_mult *= 1.04
+        if 46.0 <= h_pci <= 51.5: pace_mult *= 1.09
+        elif h_pci_type == "A": pace_mult *= 1.06
         else: pace_mult *= 0.95
-        if kyaku == 1: pace_mult *= 0.92
-        elif kyaku == 2: pace_mult *= 1.04
+        if kyaku == 1: pace_mult *= 0.93
+        elif kyaku == 2: pace_mult *= 1.05
         elif kyaku == 3: pace_mult *= 1.08
         elif kyaku == 4: pace_mult *= 1.02
         if makuri_flag: pace_mult *= 1.05
-        if is_fast_cushion:
-            if time_diff <= -0.25: pace_mult *= 1.04
-            elif time_diff >= 0.45: pace_mult *= 0.96
 
     elif expected_pace in ["H_MAEKUZURE", "H"]:
         if h_pci_type == "A": pace_mult *= 1.12
-        elif h_pci_type == "B": pace_mult *= 1.02
-        else: pace_mult *= 0.94
+        elif h_pci_type == "B": pace_mult *= 1.03
+        else: pace_mult *= 0.93
         if kyaku == 1: pace_mult *= 0.86
-        elif kyaku == 2: pace_mult *= 0.94
+        elif kyaku == 2: pace_mult *= 0.95
         elif kyaku == 3: pace_mult *= 1.08
         elif kyaku == 4: pace_mult *= 1.11
 
-    if course_rpci > 0 and h_pci > 0:
-        if abs(course_rpci - h_pci) >= 4.0:
-            pace_mult *= 0.95
+    # ハンデ戦・長距離・道悪での斤量差補正
+    kinryou_mult = 1.00
+    if distance >= 2000 or is_wet_or_tough:
+        if horse.kinryou >= 58.5 and kyaku >= 3:
+            kinryou_mult = 0.975
+        elif horse.kinryou <= 54.0 and kyaku <= 2:
+            kinryou_mult = 1.020
 
     bias_mult = 1.0
-    boost = 1.08
-    nerf = 0.92
-    if bias_strength == "弱":
-        boost = 1.03; nerf = 0.97
-    elif bias_strength == "極端":
-        boost = 1.15; nerf = 0.80
-
+    boost = 1.03 if bias_strength == "弱" else (1.15 if bias_strength == "極端" else 1.08)
+    nerf = 0.97 if bias_strength == "弱" else (0.80 if bias_strength == "極端" else 0.92)
     half_boost = 1.0 + (boost - 1.0) * 0.5
     half_nerf = 1.0 - (1.0 - nerf) * 0.5
 
     if track_bias == "イン前有利 (1〜4枠・先行)":
-        if waku <= 4 and kyaku <= 2:
-            bias_mult = boost
-        elif (waku <= 4 and kyaku == 3) or (waku == 5 and kyaku <= 2):
-            bias_mult = half_boost
-        elif waku >= 6 and kyaku >= 3:
-            bias_mult = nerf
-        elif waku >= 6 or kyaku == 4:
-            bias_mult = half_nerf
+        if waku <= 4 and kyaku <= 2: bias_mult = boost
+        elif (waku <= 4 and kyaku == 3) or (waku == 5 and kyaku <= 2): bias_mult = half_boost
+        elif waku >= 6 and kyaku >= 3: bias_mult = nerf
+        elif waku >= 6 or kyaku == 4: bias_mult = half_nerf
     elif track_bias == "外差し有利 (5〜8枠・差し追込)":
-        if waku >= 5 and kyaku >= 3:
-            bias_mult = boost
-        elif (waku >= 5 and kyaku == 2) or (waku <= 4 and kyaku >= 3):
-            bias_mult = half_boost
-        elif waku <= 3 and kyaku <= 2:
-            bias_mult = nerf
-        elif waku <= 4 and kyaku == 1:
-            bias_mult = half_nerf
+        if waku >= 5 and kyaku >= 3: bias_mult = boost
+        elif (waku >= 5 and kyaku == 2) or (waku <= 4 and kyaku >= 3): bias_mult = half_boost
+        elif waku <= 3 and kyaku <= 2: bias_mult = nerf
+        elif waku <= 4 and kyaku == 1: bias_mult = half_nerf
     elif track_bias == "前残り (逃げ・先行有利)":
-        if kyaku <= 2: bias_mult = boost
-        elif kyaku >= 3: bias_mult = nerf
+        bias_mult = boost if kyaku <= 2 else nerf
     elif track_bias == "差し有利 (外伸び)":
-        if kyaku >= 3: bias_mult = boost
-        elif kyaku <= 2: bias_mult = nerf
+        bias_mult = boost if kyaku >= 3 else nerf
     elif track_bias == "内枠有利 (インベタ)":
-        if waku <= 3: bias_mult = boost
-        elif waku == 4: bias_mult = half_boost
-        elif waku >= 6: bias_mult = nerf
+        bias_mult = boost if waku <= 3 else (half_boost if waku == 4 else (nerf if waku >= 6 else 1.0))
     elif track_bias == "外枠有利":
-        if waku >= 6: bias_mult = boost
-        elif waku == 5: bias_mult = half_boost
-        elif waku <= 3: bias_mult = nerf
+        bias_mult = boost if waku >= 6 else (half_boost if waku == 5 else (nerf if waku <= 3 else 1.0))
 
     if is_elite_jiriki and bias_mult < 1.0:
         bias_mult = 1.0 - (1.0 - bias_mult) * 0.42
-        if total_horses >= 15 and is_fast_cushion and waku >= 6 and kyaku >= 3 and time_diff <= 0.05:
+        if total_horses >= 15 and waku >= 6 and kyaku >= 3:
             bias_mult = max(bias_mult, 0.985)
 
     condition_mult = 1.00
@@ -2629,7 +2513,7 @@ def calculate_comprehensive_score(
     except:
         pass
 
-    combined_cond_mult = condition_mult * rotation_mult * training_mult
+    combined_cond_mult = condition_mult * rotation_mult * training_mult * kinryou_mult
     total_mult = (
         pace_mult
         * bias_mult
@@ -2679,9 +2563,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         u = h["umaban"]
         if u == axis_umaban:
             continue
-        if h.get("condition_mult", 1.0) <= 0.88:
-            continue
-        if h.get("training_rank", "B") == "C":
+        if h.get("condition_mult", 1.0) <= 0.88 or h.get("training_rank", "B") == "C":
             continue
         if len(main_2nd_horses) < 3 and (h["shisu"] >= 53.0 or (h["myoumi"] >= 57.0 and h["shisu"] >= 50.0)):
             main_2nd_horses.append(h)
@@ -2710,10 +2592,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         if is_jiriki_top:
             saver_3rd_horses.append(h)
             h["is_bias_victim_rescued"] = True
-            if t_mult <= 0.95:
-                h["rescue_type"] = "time_warn"
-            else:
-                h["rescue_type"] = "bias_victim"
+            h["rescue_type"] = "time_warn" if t_mult <= 0.95 else "bias_victim"
         elif (h["stage1_rank"] <= 6 or h["stage1_shisu"] >= 53.0) and t_mult >= 0.94:
             saver_3rd_horses.append(h)
             h["is_bias_victim_rescued"] = True
@@ -2722,14 +2601,17 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         if len(saver_3rd_horses) >= 3:
             break
 
+    # 道悪巧者・前残り警戒穴・瞬発ギア馬を3列目に優先ピックアップ
     for h in by_stage2:
         u = h["umaban"]
         if u == axis_umaban or u in main_2nd_umabans:
             continue
-        has_gear = bool(h.get("lap_gear_label"))
+        has_special_badge = bool(h.get("lap_gear_label")) or any(
+            "前残り" in b or "道悪" in b for b in h.get("tactical_badges", [])
+        )
         if (
             h not in saver_3rd_horses
-            and (h["shisu"] >= 52.5 or h["myoumi"] >= 57.5 or (has_gear and h["shisu"] >= 50.0))
+            and (h["shisu"] >= 52.0 or h["myoumi"] >= 57.0 or (has_special_badge and h["shisu"] >= 49.5))
             and h.get("condition_mult", 1.0) > 0.88
             and len(saver_3rd_horses) < 5
         ):
@@ -2788,7 +2670,7 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
                 h["role_label"] = f"🛡️ 地力上位・バイアス救済 (地力{h['stage1_rank']}位)"
             else:
                 h["role_code"] = "SAVER_3RD"
-                h["role_label"] = "🛡️ 3列目押さえ (妙味・一芸ギア圏内)"
+                h["role_label"] = "🛡️ 3列目押さえ (道悪・前残り・ギア特注)"
         elif u not in eliminated_umabans:
             h["role_code"] = "OTHER"
             h["role_label"] = "静観 (指数下位)"
@@ -2797,10 +2679,8 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
     row2 = main_2nd_umabans
     row3 = main_2nd_umabans + saver_3rd_umabans
 
-    value_pick = None
     cands_for_val = [h for h in main_2nd_horses if h["odds"] >= 6.0 and h["myoumi"] >= 55.0]
-    if cands_for_val:
-        value_pick = sorted(cands_for_val, key=lambda x: x["myoumi"], reverse=True)[0]
+    value_pick = sorted(cands_for_val, key=lambda x: x["myoumi"], reverse=True)[0] if cands_for_val else None
     tansho_list = [{"umaban": axis_umaban, "bamei": axis_horse["bamei"], "type": "本命単勝", "odds": axis_horse["odds"]}]
     if value_pick and value_pick["umaban"] != axis_umaban:
         tansho_list.append({"umaban": value_pick["umaban"], "bamei": value_pick["bamei"], "type": "妙味穴単勝", "odds": value_pick["odds"]})
@@ -2810,33 +2690,19 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
         fukusho_list.append({"umaban": mh["umaban"], "bamei": mh["bamei"], "type": "妙味複勝", "odds": mh["odds"]})
 
     wide_combos = [f"{axis_umaban} - {u}" for u in row2]
+    sanrenpuku_nagashi_combos = [
+        f"{axis_umaban} - { sorted([row3[i], row3[j]])[0] } - { sorted([row3[i], row3[j]])[1] }"
+        for i in range(len(row3)) for j in range(i + 1, len(row3))
+    ]
 
-    sanrenpuku_nagashi_combos = []
-    for i in range(len(row3)):
-        for j in range(i + 1, len(row3)):
-            pair = sorted([row3[i], row3[j]])
-            sanrenpuku_nagashi_combos.append(f"{axis_umaban} - {pair[0]} - {pair[1]}")
-
-    sanrenpuku_form_set = set()
-    for a in row1:
-        for b in row2:
-            for c in row3:
-                if len({a, b, c}) == 3:
-                    sanrenpuku_form_set.add(tuple(sorted([a, b, c])))
+    sanrenpuku_form_set = {
+        tuple(sorted([a, b, c]))
+        for a in row1 for b in row2 for c in row3 if len({a, b, c}) == 3
+    }
     sanrenpuku_form_combos = [f"{t[0]} - {t[1]} - {t[2]}" for t in sorted(sanrenpuku_form_set)]
 
-    sanrentan_nagashi_combos = []
-    for b in row3:
-        for c in row3:
-            if b != c:
-                sanrentan_nagashi_combos.append(f"{axis_umaban} → {b} → {c}")
-
-    sanrentan_form_combos = []
-    for a in row1:
-        for b in row2:
-            for c in row3:
-                if a != b and b != c and a != c:
-                    sanrentan_form_combos.append(f"{a} → {b} → {c}")
+    sanrentan_nagashi_combos = [f"{axis_umaban} → {b} → {c}" for b in row3 for c in row3 if b != c]
+    sanrentan_form_combos = [f"{a} → {b} → {c}" for a in row1 for b in row2 for c in row3 if a != b and b != c and a != c]
 
     eliminated_details = [
         {"umaban": h["umaban"], "bamei": h["bamei"], "reason": h["role_label"], "odds": h["odds"]}
@@ -2848,14 +2714,9 @@ def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str
             "axis_1st": [{"umaban": axis_horse["umaban"], "bamei": axis_horse["bamei"], "shisu": axis_horse["shisu"], "stage1_shisu": axis_horse["stage1_shisu"], "odds": axis_horse["odds"]}],
             "main_2nd": [{"umaban": h["umaban"], "bamei": h["bamei"], "shisu": h["shisu"], "stage1_shisu": h["stage1_shisu"], "myoumi": h["myoumi"], "odds": h["odds"]} for h in main_2nd_horses],
             "saver_3rd": [{
-                "umaban": h["umaban"],
-                "bamei": h["bamei"],
-                "shisu": h["shisu"],
-                "stage1_shisu": h["stage1_shisu"],
-                "stage1_rank": h["stage1_rank"],
-                "odds": h["odds"],
-                "rescued": h.get("is_bias_victim_rescued", False),
-                "rescue_type": h.get("rescue_type", "normal"),
+                "umaban": h["umaban"], "bamei": h["bamei"], "shisu": h["shisu"],
+                "stage1_shisu": h["stage1_shisu"], "stage1_rank": h["stage1_rank"], "odds": h["odds"],
+                "rescued": h.get("is_bias_victim_rescued", False), "rescue_type": h.get("rescue_type", "normal"),
                 "role_label": h.get("role_label", "")
             } for h in saver_3rd_horses],
             "eliminated": eliminated_details
@@ -2878,27 +2739,32 @@ def diagnose_race(request: RaceRequest):
     cond_enc = safe_encode('condition', request.track_condition)
     place_code = request.race_id[4:6] if len(request.race_id) >= 6 else "05"
     course_key = f"{place_code}_{request.course_type}_{request.distance}"
-    
+
     c_stats = course_history_db.get(course_key, {})
     top3_up = c_stats.get('top3_up', [])
     pace_f = c_stats.get('pace_first', [])
     pace_l = c_stats.get('pace_last', [])
-    
+
     expected_standard_time = get_expected_standard_time(c_stats, request.course_type, request.distance)
-    
     base_req_up = float(np.mean(top3_up)) if top3_up else 35.0
     base_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
     base_pace_l = float(np.mean(pace_l)) if pace_l else 35.0
 
     base_rpci = round((base_pace_f / base_pace_l) * 50.0, 1) if base_pace_l > 0 else 50.0
     base_rpci_type = get_pci_label(base_rpci)
-    
+
     avg_pace_f, avg_pace_l, avg_req_up = adjust_pace_times(
         request.expected_pace, base_pace_f, base_pace_l, base_req_up
     )
-    
+    if request.track_condition in ["稍", "重", "不"] or request.cushion_value <= 8.9:
+        avg_req_up += 0.8 if request.track_condition in ["重", "不"] else 0.4
+
     place_dict = {'01':'札幌', '02':'函館', '03':'福島', '04':'新潟', '05':'東京', '06':'中山', '07':'中京', '08':'京都', '09':'阪神', '10':'小倉'}
     total_horses_cnt = len(request.horses)
+
+    valid_odds_h = [h for h in request.horses if h.odds > 1.0]
+    fav5 = sorted(valid_odds_h, key=lambda x: x.odds)[:5] if len(valid_odds_h) >= 5 else request.horses[:5]
+    fav_closer_skew = sum(1 for h in fav5 if int(round(h.kyakushitsu)) >= 3) >= 4
 
     temp_items = []
     all_horses_early_info = []
@@ -2921,12 +2787,11 @@ def diagnose_race(request: RaceRequest):
         time_diff_base = course_up - base_req_up
         time_diff = course_up - avg_req_up
         kishu_enc = safe_encode('kishu', horse.kishu)
-        
+
         time_limit_mult = get_time_limit_multiplier(
-            horse.bamei, request.course_type, request.distance, 
+            horse.bamei, request.course_type, request.distance,
             expected_standard_time, request.cushion_value, request.track_condition
         )
-
         s1_ped_mult, s2_ped_mult, ped_label = evaluate_pedigree_and_distance_aptitude(
             horse.bamei, request.course_type, request.distance, request.track_condition, request.cushion_value
         )
@@ -2940,15 +2805,14 @@ def diagnose_race(request: RaceRequest):
             horse.bamei, request.course_type, request.distance,
             request.cushion_value, request.track_condition, request.expected_pace
         )
-
         jockey_mult, jockey_label = evaluate_jockey_stage_synergy(
             horse.kishu, int(horse.wakuban), int(round(horse.kyakushitsu)),
-            request.distance, request.cushion_value, makuri_flag
+            request.distance, request.cushion_value, makuri_flag, track_cond=request.track_condition
         )
 
         t_rank = str(horse.training_rank or "B").upper()
         training_mult = TRAINING_RANK_MULTIPLIERS.get(t_rank, 1.00)
-        
+
         stage1_input = pd.DataFrame([{
             '枠番': 4.0, '馬番': 8.0, '斤量': horse.kinryou, '馬体重_数値': 480.0,
             'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
@@ -2974,26 +2838,12 @@ def diagnose_race(request: RaceRequest):
         h_pci, h_pci_type = get_horse_pci_stats(horse.bamei)
 
         temp_items.append({
-            "horse": horse,
-            "raw_pred": raw_pred,
-            "stage1_prob": stage1_prob,
-            "power_score": power_score,
-            "makuri_flag": makuri_flag,
-            "early_3f_sec": early_3f_sec,
-            "h_pci": h_pci,
-            "h_pci_type": h_pci_type,
-            "time_diff": time_diff,
-            "time_limit_mult": time_limit_mult,
-            "s2_ped_mult": s2_ped_mult,
-            "ped_label": ped_label,
-            "rot_mult": rot_mult,
-            "rot_label": rot_label,
-            "gear_mult": gear_mult,
-            "gear_label": gear_label,
-            "jockey_mult": jockey_mult,
-            "jockey_label": jockey_label,
-            "t_rank": t_rank,
-            "training_mult": training_mult
+            "horse": horse, "raw_pred": raw_pred, "stage1_prob": stage1_prob,
+            "power_score": power_score, "makuri_flag": makuri_flag, "early_3f_sec": early_3f_sec,
+            "h_pci": h_pci, "h_pci_type": h_pci_type, "time_diff": time_diff,
+            "time_limit_mult": time_limit_mult, "s2_ped_mult": s2_ped_mult, "ped_label": ped_label,
+            "rot_mult": rot_mult, "rot_label": rot_label, "gear_mult": gear_mult, "gear_label": gear_label,
+            "jockey_mult": jockey_mult, "jockey_label": jockey_label, "t_rank": t_rank, "training_mult": training_mult
         })
 
     s1_probs = [item["stage1_prob"] for item in temp_items]
@@ -3007,82 +2857,52 @@ def diagnose_race(request: RaceRequest):
     for idx, item in enumerate(by_s1):
         item["stage1_rank"] = idx + 1
 
-    stage1_gap_to_2nd = (
-        round(by_s1[0]["stage1_shisu"] - by_s1[1]["stage1_shisu"], 1)
-        if len(by_s1) >= 2
-        else 0.0
-    )
+    stage1_gap_to_2nd = round(by_s1[0]["stage1_shisu"] - by_s1[1]["stage1_shisu"], 1) if len(by_s1) >= 2 else 0.0
 
     for item in temp_items:
         horse = item["horse"]
-
         tactical_mult, tactical_badges, box_risk_level = evaluate_box_in_and_lead_risk(
-            horse.wakuban, horse.umaban, horse.kyakushitsu, horse.odds,
-            item["stage1_rank"], stage1_gap_to_2nd,
-            total_horses_cnt, all_horses_early_info,
-            request.course_type, request.distance, request.cushion_value
+            horse.wakuban, horse.umaban, horse.kyakushitsu, horse.odds, horse.kinryou,
+            item["stage1_rank"], stage1_gap_to_2nd, total_horses_cnt, all_horses_early_info,
+            request.course_type, request.distance, request.cushion_value, fav_closer_skew=fav_closer_skew
         )
 
         final_score, bias_mult, pace_mult, cond_mult = calculate_comprehensive_score(
             item["raw_pred"], horse, item["power_score"], item["makuri_flag"],
-            item["h_pci"], item["h_pci_type"], item["time_diff"], 
+            item["h_pci"], item["h_pci_type"], item["time_diff"],
             request.expected_pace, request.track_bias, request.bias_strength, request.cushion_value,
             base_rpci, item["time_limit_mult"], item["s2_ped_mult"],
             item["rot_mult"], item["training_mult"],
             stage1_rank=item["stage1_rank"], total_horses=total_horses_cnt,
             track_condition=request.track_condition,
             tactical_mult=tactical_mult, gear_mult=item["gear_mult"],
-            jockey_mult=item["jockey_mult"]
+            jockey_mult=item["jockey_mult"], distance=request.distance
         )
 
         all_badges: List[str] = list(tactical_badges)
-        if item["gear_label"]:
-            all_badges.append(item["gear_label"])
-        if item["jockey_label"]:
-            all_badges.append(item["jockey_label"])
+        if item["gear_label"]: all_badges.append(item["gear_label"])
+        if item["jockey_label"]: all_badges.append(item["jockey_label"])
+        if "☔" in item["ped_label"] and not any("☔" in b for b in all_badges):
+            all_badges.append("☔道悪血統・実績◎")
 
-        display_rot_label = item["rot_label"]
-        if tactical_badges:
-            display_rot_label = (
-                f"{' '.join(tactical_badges)} / {display_rot_label}"
-                if display_rot_label
-                else " ".join(tactical_badges)
-            )
-
-        display_ped_label = item["ped_label"]
+        display_rot_label = (f"{' '.join(tactical_badges)} / {item['rot_label']}" if item["rot_label"] else " ".join(tactical_badges)) if tactical_badges else item["rot_label"]
         extra_tags = [x for x in [item["gear_label"], item["jockey_label"]] if x]
-        if extra_tags:
-            display_ped_label = (
-                f"{display_ped_label} [{' / '.join(extra_tags)}]"
-                if display_ped_label
-                else " / ".join(extra_tags)
-            )
+        display_ped_label = (f"{item['ped_label']} [{' / '.join(extra_tags)}]" if item["ped_label"] else " / ".join(extra_tags)) if extra_tags else item["ped_label"]
 
         history_details = build_horse_history_details(horse.bamei, place_dict)
 
         horses_data.append({
             "wakuban": int(horse.wakuban),
             "umaban": int(horse.umaban), "bamei": horse.bamei, "odds": float(horse.odds),
-            "stage1_prob": item["stage1_prob"],
-            "stage1_shisu": item["stage1_shisu"],
-            "stage1_rank": item["stage1_rank"],
+            "stage1_prob": item["stage1_prob"], "stage1_shisu": item["stage1_shisu"], "stage1_rank": item["stage1_rank"],
             "base_prob": final_score, "time_diff": round(item["time_diff"], 2),
-            "pci": item["h_pci"], "pci_type": item["h_pci_type"],
-            "early_3f_sec": item["early_3f_sec"],
+            "pci": item["h_pci"], "pci_type": item["h_pci_type"], "early_3f_sec": item["early_3f_sec"],
             "bataijuu": horse.bataijuu, "weight_change": horse.weight_change,
-            "training_rank": item["t_rank"],
-            "rotation_label": display_rot_label,
-            "pedigree_label": display_ped_label,
-            "tactical_badges": all_badges,
-            "box_in_risk_level": box_risk_level,
-            "lap_gear_label": item["gear_label"],
+            "training_rank": item["t_rank"], "rotation_label": display_rot_label, "pedigree_label": display_ped_label,
+            "tactical_badges": all_badges, "box_in_risk_level": box_risk_level, "lap_gear_label": item["gear_label"],
             "time_limit_mult": round(item["time_limit_mult"], 2),
-            "bias_mult": bias_mult,
-            "pace_mult": pace_mult,
-            "condition_mult": cond_mult,
-            "tactical_mult": tactical_mult,
-            "power_score": round(item["power_score"], 2),
-            "history_details": history_details 
+            "bias_mult": bias_mult, "pace_mult": pace_mult, "condition_mult": cond_mult, "tactical_mult": tactical_mult,
+            "power_score": round(item["power_score"], 2), "history_details": history_details
         })
 
     probs = [h["base_prob"] for h in horses_data]
@@ -3108,7 +2928,8 @@ def diagnose_race(request: RaceRequest):
             h["raw_ev"] = 0.0
 
     if myoumi_values:
-        m_mean = np.mean(myoumi_values); m_std = np.std(myoumi_values)
+        m_mean = np.mean(myoumi_values)
+        m_std = np.std(myoumi_values)
         for h in horses_data:
             if h["odds"] > 0:
                 m_shisu = ((h["raw_ev"] - m_mean) / m_std) * 10 + 50 if m_std > 0 else 50.0
@@ -3116,7 +2937,8 @@ def diagnose_race(request: RaceRequest):
             else:
                 h["myoumi"] = 0.0
     else:
-        for h in horses_data: h["myoumi"] = 0.0
+        for h in horses_data:
+            h["myoumi"] = 0.0
 
     horses_data.sort(key=lambda x: x["shisu"], reverse=True)
     for idx, h in enumerate(horses_data):
@@ -3135,207 +2957,40 @@ def diagnose_race(request: RaceRequest):
         "rpci_type": base_rpci_type
     }
 
+
 @app.post("/simulate_race")
 def simulate_race(request: RaceRequest):
-    horses_data = []
-    course_enc = safe_encode('course', request.course_type)
-    weather_enc = safe_encode('weather', request.weather)
-    cond_enc = safe_encode('condition', request.track_condition)
-    place_code = request.race_id[4:6] if len(request.race_id) >= 6 else "05"
-    course_key = f"{place_code}_{request.course_type}_{request.distance}"
-    
-    c_stats = course_history_db.get(course_key, {})
-    top3_up = c_stats.get('top3_up', [])
-    pace_f = c_stats.get('pace_first', [])
-    pace_l = c_stats.get('pace_last', [])
-    expected_standard_time = get_expected_standard_time(c_stats, request.course_type, request.distance)
-    
-    base_req_up = float(np.mean(top3_up)) if top3_up else 35.0
-    base_pace_f = float(np.mean(pace_f)) if pace_f else 35.0
-    base_pace_l = float(np.mean(pace_l)) if pace_l else 35.0
-    base_rpci = round((base_pace_f / base_pace_l) * 50.0, 1) if base_pace_l > 0 else 50.0
-    
-    avg_pace_f, avg_pace_l, avg_req_up = adjust_pace_times(request.expected_pace, base_pace_f, base_pace_l, base_req_up)
-    total_horses_cnt = len(request.horses)
-
-    temp_items = []
-    all_horses_early_info = []
-
-    for horse in request.horses:
-        h_stats = horse_history_db.get(horse.bamei, {})
-        zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
-        early_3f_sec = estimate_horse_early_3f_speed(horse.bamei)
-        effective_zenso_for_lgb = min(zenso, 5.0) if power_score >= 0.77 else zenso
-
-        all_horses_early_info.append({
-            "umaban": int(horse.umaban),
-            "wakuban": int(horse.wakuban),
-            "kyakushitsu": int(round(horse.kyakushitsu)),
-            "early_3f": early_3f_sec
-        })
-
-        course_up_times = h_stats.get('course_up_times', {}).get(course_key, [])
-        course_up = float(np.mean(course_up_times)) if course_up_times else real_agari
-        time_diff_base = course_up - base_req_up
-        time_diff = course_up - avg_req_up
-        kishu_enc = safe_encode('kishu', horse.kishu)
-        
-        time_limit_mult = get_time_limit_multiplier(
-            horse.bamei, request.course_type, request.distance, 
-            expected_standard_time, request.cushion_value, request.track_condition
-        )
-        s1_ped_mult, s2_ped_mult, _ = evaluate_pedigree_and_distance_aptitude(
-            horse.bamei, request.course_type, request.distance, request.track_condition, request.cushion_value
-        )
-        rot_mult = float(horse.rotation_mult) if horse.rotation_mult else 1.00
-        gear_mult, _ = evaluate_lap_gear_aptitude(
-            horse.bamei, request.course_type, request.distance,
-            request.cushion_value, request.track_condition, request.expected_pace
-        )
-        jockey_mult, _ = evaluate_jockey_stage_synergy(
-            horse.kishu, int(horse.wakuban), int(round(horse.kyakushitsu)),
-            request.distance, request.cushion_value, makuri_flag
-        )
-        t_rank = str(horse.training_rank or "B").upper()
-        training_mult = TRAINING_RANK_MULTIPLIERS.get(t_rank, 1.00)
-
-        stage1_input = pd.DataFrame([{
-            '枠番': 4.0, '馬番': 8.0, '斤量': horse.kinryou, '馬体重_数値': 480.0,
-            'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
-            'track_condition_enc': cond_enc, '舞台_平均前半ペース': base_pace_f, '舞台_平均後半ペース': base_pace_l,
-            '舞台_平均要求上がり': base_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': effective_zenso_for_lgb,
-            '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
-            '上がりタイム差分': time_diff_base, 'kishu_enc': kishu_enc
-        }])
-        raw_pred_stage1 = float(model.predict(stage1_input)[0])
-        stage1_prob = calculate_stage1_pure_score(
-            raw_pred_stage1, horse, power_score, time_diff_base, s1_ped_mult
-        )
-        
-        input_data = pd.DataFrame([{
-            '枠番': horse.wakuban, '馬番': horse.umaban, '斤量': horse.kinryou, '馬体重_数値': horse.bataijuu,
-            'distance': request.distance, 'course_type_enc': course_enc, 'weather_enc': weather_enc,
-            'track_condition_enc': cond_enc, '舞台_平均前半ペース': avg_pace_f, '舞台_平均後半ペース': avg_pace_l,
-            '舞台_平均要求上がり': avg_req_up, '過去基本脚質': horse.kyakushitsu, '前走着順': effective_zenso_for_lgb,
-            '近3走_平均上がり': real_agari, '同舞台_平均上がり': course_up, '出走回数': kaisuu,
-            '上がりタイム差分': time_diff, 'kishu_enc': kishu_enc
-        }])
-        
-        raw_pred = float(model.predict(input_data)[0])
-        h_pci, h_pci_type = get_horse_pci_stats(horse.bamei)
-
-        temp_items.append({
-            "horse": horse,
-            "raw_pred": raw_pred,
-            "stage1_prob": stage1_prob,
-            "power_score": power_score,
-            "makuri_flag": makuri_flag,
-            "h_pci": h_pci,
-            "h_pci_type": h_pci_type,
-            "time_diff": time_diff,
-            "time_limit_mult": time_limit_mult,
-            "s2_ped_mult": s2_ped_mult,
-            "rot_mult": rot_mult,
-            "gear_mult": gear_mult,
-            "jockey_mult": jockey_mult,
-            "training_mult": training_mult
-        })
-
-    s1_probs = [item["stage1_prob"] for item in temp_items]
-    s1_mean = np.mean(s1_probs) if s1_probs else 0
-    s1_std = np.std(s1_probs) if s1_probs else 1
-    for item in temp_items:
-        s1_val = ((item["stage1_prob"] - s1_mean) / s1_std) * 10 + 50 if s1_std > 0 else 50.0
-        item["stage1_shisu"] = round(float(s1_val), 1)
-
-    by_s1 = sorted(temp_items, key=lambda x: x["stage1_shisu"], reverse=True)
-    for idx, item in enumerate(by_s1):
-        item["stage1_rank"] = idx + 1
-
-    stage1_gap_to_2nd = (
-        round(by_s1[0]["stage1_shisu"] - by_s1[1]["stage1_shisu"], 1)
-        if len(by_s1) >= 2
-        else 0.0
-    )
-
-    for item in temp_items:
-        horse = item["horse"]
-        tactical_mult, _, _ = evaluate_box_in_and_lead_risk(
-            horse.wakuban, horse.umaban, horse.kyakushitsu, horse.odds,
-            item["stage1_rank"], stage1_gap_to_2nd,
-            total_horses_cnt, all_horses_early_info,
-            request.course_type, request.distance, request.cushion_value
-        )
-
-        final_score, _, _, _ = calculate_comprehensive_score(
-            item["raw_pred"], horse, item["power_score"], item["makuri_flag"],
-            item["h_pci"], item["h_pci_type"], item["time_diff"], 
-            request.expected_pace, request.track_bias, request.bias_strength, request.cushion_value,
-            base_rpci, item["time_limit_mult"], item["s2_ped_mult"],
-            item["rot_mult"], item["training_mult"],
-            stage1_rank=item["stage1_rank"], total_horses=total_horses_cnt,
-            track_condition=request.track_condition,
-            tactical_mult=tactical_mult, gear_mult=item["gear_mult"],
-            jockey_mult=item["jockey_mult"]
-        )
-        
-        horses_data.append({
-            "umaban": int(horse.umaban), "bamei": horse.bamei, "odds": float(horse.odds),
-            "base_prob": final_score, "time_diff": round(item["time_diff"], 2),
-            "pci": item["h_pci"], "pci_type": item["h_pci_type"]
-        })
-    
-    probs = [h["base_prob"] for h in horses_data]
-    mean_prob = np.mean(probs) if probs else 0
-    std_prob = np.std(probs) if probs else 1
-    total_prob = sum(probs) if sum(probs) > 0 else 1.0
-
-    for h in horses_data:
-        shisu = ((h["base_prob"] - mean_prob) / std_prob) * 10 + 50 if std_prob > 0 else 50.0
-        h["shisu"] = round(shisu, 1)
-        h["norm_win_prob"] = h["base_prob"] / total_prob
-
-    myoumi_values = []
-    for h in horses_data:
-        if h["odds"] > 0:
-            effective_odds = min(float(h["odds"]), 35.0)
-            ability_weight = 1.0 if h["shisu"] >= 45.0 else 0.5
-            ev = h["norm_win_prob"] * effective_odds * ability_weight
-            h["raw_ev"] = ev
-            myoumi_values.append(ev)
-        else:
-            h["raw_ev"] = 0.0
-
-    if myoumi_values:
-        m_mean = np.mean(myoumi_values); m_std = np.std(myoumi_values)
-        for h in horses_data:
-            if h["odds"] > 0:
-                h["myoumi"] = ((h["raw_ev"] - m_mean) / m_std) * 10 + 50 if m_std > 0 else 50.0
-            else:
-                h["myoumi"] = 50.0
-    else:
-        for h in horses_data: h["myoumi"] = 50.0
+    diag_res = diagnose_race(request)
+    diagnosed = diag_res.get("diagnosis", [])
 
     sim_scores = []
-    for h in horses_data:
-        target_index = (h["shisu"] * 0.85) + (h["myoumi"] * 0.15)
+    for h in diagnosed:
+        target_index = (h["shisu"] * 0.85) + (h.get("myoumi", 50.0) * 0.15)
         noise = np.random.normal(0, 3.2)
-        score = target_index + noise
         sim_scores.append({
-            "umaban": h["umaban"], "bamei": h["bamei"],
-            "shisu": h["shisu"], "time_diff": h["time_diff"], "score": score
+            "umaban": h["umaban"],
+            "bamei": h["bamei"],
+            "shisu": h["shisu"],
+            "time_diff": h["time_diff"],
+            "score": target_index + noise
         })
-        
+
     sim_scores.sort(key=lambda x: x["score"], reverse=True)
-    
-    results = []
-    for i, sim in enumerate(sim_scores):
-        results.append({
-            "umaban": sim["umaban"], "bamei": sim["bamei"],
-            "shisu": sim["shisu"], "time_diff": sim["time_diff"], "rank": i + 1
-        })
-    
+    results = [
+        {
+            "umaban": sim["umaban"],
+            "bamei": sim["bamei"],
+            "shisu": sim["shisu"],
+            "time_diff": sim["time_diff"],
+            "rank": i + 1
+        }
+        for i, sim in enumerate(sim_scores)
+    ]
+
     return {
-        "status": "success", "ranking": results, "req_up": round(avg_req_up, 2),
-        "pace_f": round(avg_pace_f, 1), "pace_l": round(avg_pace_l, 1)
+        "status": "success",
+        "ranking": results,
+        "req_up": diag_res.get("req_up", 35.0),
+        "pace_f": diag_res.get("pace_f", 35.0),
+        "pace_l": diag_res.get("pace_l", 35.0)
     }
