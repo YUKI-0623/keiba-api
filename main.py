@@ -13,7 +13,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (本馬雨優先・馬格斤量・初角距離・WIN5完全統合版)")
+app = FastAPI(title="競馬シミュレーションAPI (ソフトキャップ・高精度EV・距離換算テン3F・完全統合版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +39,6 @@ runtime_pedigree_db: Dict[str, Dict[str, str]] = {}
 html_response_cache: Dict[str, str] = {}
 http_session = requests.Session()
 
-# 競馬場コード別の回り方向・坂特性
 VENUE_META: Dict[str, Dict[str, str]] = {
     "01": {"name": "札幌", "turn": "RIGHT", "slope": "FLAT", "size": "SMALL"},
     "02": {"name": "函館", "turn": "RIGHT", "slope": "FLAT", "size": "SMALL"},
@@ -181,21 +180,13 @@ JOCKEY_STAGE_BONUSES: Dict[str, Dict[str, float]] = {
 
 
 def get_first_corner_type(place_code: str, course_type: str, distance: int) -> str:
-    """
-    ★新機能③: スタートから最初のコーナーまでの距離タイプを返す
-    - 'SHORT_1C': 初角までが短く（約200〜330mまたはポケット直後カーブ）、外枠先行の距離ロスが大きい舞台
-    - 'LONG_1C': 初角までが十分に長く（約420m〜650m）、外枠でもスムーズに位置を取れる舞台
-    - 'NORMAL_1C': 標準（約340〜410m）
-    """
     if course_type == "芝":
-        # 東京芝2000m(1角ポケット)、中山芝1600/1800/2000m、京都・阪神内2000m、中京芝2000m、ローカル小回り1800/2000m
         if (place_code == "05" and distance == 2000) or \
            (place_code == "06" and distance in [1600, 1800, 2000, 2500]) or \
            (place_code in ["08", "09"] and distance == 2000) or \
            (place_code == "07" and distance in [1400, 1600, 2000]) or \
            (place_code in ["01", "02", "03", "10"] and distance in [1700, 1800, 2000]):
             return "SHORT_1C"
-        # 東京芝1600/1800/2400m、京都外1600/1800/2200/2400m、阪神外1600/1800/2400m、新潟芝1600/1800/2000m
         if (place_code == "05" and distance in [1400, 1600, 1800, 2400]) or \
            (place_code in ["08", "09"] and distance in [1600, 1800, 2200, 2400]) or \
            (place_code == "04" and distance in [1400, 1600, 1800, 2000, 2200]):
@@ -274,6 +265,23 @@ def parse_date_str(d_str: str) -> Optional[datetime]:
         except:
             return None
     return None
+
+
+def sort_records_chronologically(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    ★新機能④-1: 過去走レコードを日付の昇順（古い順 ➔ 最新走が末尾 [-1]）に確実にソートする。
+    日付がないレコードは元の順序を保ったまま先頭側に配置する。
+    """
+    if not records or len(records) <= 1:
+        return records
+    indexed = []
+    for idx, r in enumerate(records):
+        dt = parse_date_str(str(r.get("date", "")))
+        has_date = 1 if dt is not None else 0
+        ts = dt.timestamp() if dt is not None else float(idx)
+        indexed.append((has_date, ts, idx, r))
+    indexed.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [x[3] for x in indexed]
 
 
 def extract_target_race_date(shutuba_html: str) -> Optional[datetime]:
@@ -384,8 +392,9 @@ def infer_margin_seconds(record: dict) -> float:
 
 def get_active_horse_records(bamei_str: str) -> List[Dict[str, Any]]:
     if bamei_str in runtime_enriched_db and runtime_enriched_db[bamei_str]:
-        return runtime_enriched_db[bamei_str]
-    return horse_history_db.get(bamei_str, {}).get('race_records', [])
+        return sort_records_chronologically(runtime_enriched_db[bamei_str])
+    raw_recs = horse_history_db.get(bamei_str, {}).get('race_records', [])
+    return sort_records_chronologically(raw_recs)
 
 
 def get_horse_pedigree_info(bamei_str: str) -> Dict[str, str]:
@@ -419,40 +428,61 @@ def calc_single_pci(course_str, time_val, up_val):
         return None
 
 
-def estimate_horse_early_3f_speed(bamei_str: str) -> float:
+def estimate_horse_early_3f_speed(bamei_str: str, target_distance: int = 2000) -> float:
+    """
+    ★新機能③: 過去走の距離（1200m〜3000m）と今回の出走距離（target_distance）のペース差を換算し、
+    前走短距離の差し馬と前走長距離の逃げ馬が同じ土俵（今回の距離基準）で正確にテン3F比較できるように補正。
+    """
     records = get_active_horse_records(bamei_str)[-5:]
     if not records:
         return 35.8
 
     early_3f_estimates = []
-    for r in records:
+    weights = []
+    for idx, r in enumerate(records):
         try:
             c_str = str(r.get('course', ''))
             m_d = re.search(r'(\d{3,4})', c_str)
-            if not m_d: continue
+            if not m_d:
+                continue
             dist = int(m_d.group(1))
-            if dist <= 800: continue
+            if dist <= 800:
+                continue
             sec = parse_time_to_seconds(r.get('time'))
             up = float(r.get('up', 0))
-            if sec is None or up <= 30.0 or sec <= up: continue
+            if sec is None or up <= 30.0 or sec <= up:
+                continue
 
             base_first_3f = ((sec - up) / (dist - 600.0)) * 600.0
+
+            # 過去走距離と今回距離のベースラップ差を補正（100mあたり約0.11秒の道中ペース差）
+            dist_diff_ offset = np.clip((target_distance - dist) * 0.0011, -0.85, 0.85)
+
             passing = str(r.get('passing', ''))
             first_corner = 6
             if passing and passing != '-':
                 p_nums = [int(x) for x in passing.split('-') if x.strip().isdigit()]
-                if p_nums: first_corner = p_nums[0]
+                if p_nums:
+                    first_corner = p_nums[0]
 
-            pos_adj = (first_corner - 5) * 0.08
-            est_val = base_first_3f + pos_adj
+            # 1角1〜2番手通過の先行力ボーナスと後方通過の位置補正
+            if first_corner <= 2:
+                pos_adj = -0.28
+            elif first_corner <= 4:
+                pos_adj = -0.10
+            else:
+                pos_adj = (first_corner - 5) * 0.08
+
+            est_val = base_first_3f + float(dist_diff_offset) + pos_adj
             if 32.5 <= est_val <= 39.5:
                 early_3f_estimates.append(est_val)
+                weights.append(1.8 if idx >= len(records) - 2 else 1.0)
         except:
             continue
 
     if not early_3f_estimates:
         return 35.8
-    return round(float(np.mean(early_3f_estimates)), 2)
+    return round(float(np.average(early_3f_estimates, weights=weights)), 2)
 
 
 def evaluate_physique_and_load_balance(
@@ -464,11 +494,6 @@ def evaluate_physique_and_load_balance(
     cushion_val: float,
     place_code: str
 ) -> tuple[float, List[str]]:
-    """
-    ★新機能②: 馬格（馬体重）× 斤量負担率（斤量/馬体重）× 馬場・コース起伏の物理パワー補正
-    - 小柄な馬（444kg以下）の高斤量負担率（12.4%以上）やタフ馬場・急坂でのパワー負荷を微割引
-    - 大型馬（496kg以上・太め残りなし）のダート・道悪・急坂コースでのパワー優位＆重斤量耐性を加点
-    """
     weight = float(bataijuu_val) if bataijuu_val and bataijuu_val > 350 else 476.0
     kinryou = float(kinryou_val) if kinryou_val and kinryou_val > 45 else 55.0
     try:
@@ -485,7 +510,6 @@ def evaluate_physique_and_load_balance(
     mult = 1.000
     badges: List[str] = []
 
-    # (1) 小柄な馬の斤量負担増・タフ馬場パワー負荷
     if weight <= 444.0 and load_ratio >= 0.124:
         mult *= 0.972
         badges.append(f"⚠️小柄・斤量負担注意({int(weight)}kg/{kinryou:.1f}kg)")
@@ -493,7 +517,6 @@ def evaluate_physique_and_load_balance(
         mult *= 0.976
         badges.append(f"⚠️小柄・道悪パワー負荷注意({int(weight)}kg)")
 
-    # (2) 大型馬のタフ馬場・ダート・急坂パワー優位（太め残り減点がない場合のみ）
     if weight >= 496.0 and cond_mult >= 0.99:
         if is_power_stage:
             mult *= 1.020 if weight >= 506.0 else 1.014
@@ -666,11 +689,6 @@ def evaluate_rebound_and_class_transition(
     target_track_cond: str = "良",
     cushion_val: float = 9.5
 ) -> tuple[float, List[str]]:
-    """
-    ★新機能①統合:
-    - 前走スロー脚余し / ハイペース先行潰れ / 重賞僅差の巻き返し検知
-    - 前走が道悪（稍・重・不）で凡走し、今回が『良馬場』かつ過去に良馬場好走実績がある馬に『🔄☀️良馬場替わり・見直し特注◎』を付与！
-    """
     records = get_active_horse_records(bamei_str)
     if not records:
         return 1.000, []
@@ -707,7 +725,6 @@ def evaluate_rebound_and_class_transition(
     badges: List[str] = []
 
     if last_rk >= 4.0:
-        # 前走道悪で負けた良馬場巧者が今回「良馬場」に戻るケース
         if target_track_cond == "良" and cushion_val >= 9.0 and last_cond in ["稍", "重", "不"] and has_good_firm_run:
             mult *= 1.030
             badges.append(f"🔄☀️良馬場替わり・見直し特注◎(前走{last_cond}馬場度外視)")
@@ -848,11 +865,6 @@ def evaluate_box_in_and_lead_risk(
     fav_closer_skew: bool = False,
     first_corner_type: str = "NORMAL_1C"
 ) -> tuple[float, List[str], str]:
-    """
-    ★新機能③統合:
-    - 初角までが短いコース（SHORT_1C）での外枠（7〜8枠）先行馬の距離ロス割引 ＆ 内枠（1〜4枠）先行馬のロスなし好位加点
-    - 初角までが長いコース（LONG_1C）での外枠先行馬のスムーズ加速優遇
-    """
     waku = int(round(float(wakuban_val)))
     umaban = int(round(float(umaban_val)))
     kyaku = int(round(float(kyakushitsu_val)))
@@ -918,7 +930,6 @@ def evaluate_box_in_and_lead_risk(
             if "🔥前残り警戒穴(人気馬後方牽制)" not in badges:
                 badges.append("🔥軽斤量×好位粘り込み警戒")
 
-    # ★新機能③: 初角までの距離（SHORT_1C vs LONG_1C）による枠順×位置取り補正
     if first_corner_type == "SHORT_1C" and total_horses >= 12:
         if waku >= 7 and kyaku <= 2:
             if is_dominant_lone_leader:
@@ -1401,7 +1412,7 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
 
     for bamei in bamei_list:
         base_recs = copy.deepcopy(horse_history_db.get(bamei, {}).get('race_records', []))
-        runtime_enriched_db[bamei] = base_recs
+        runtime_enriched_db[bamei] = sort_records_chronologically(base_recs)
         if bamei in KNOWN_HORSE_PEDIGREE and bamei not in runtime_pedigree_db:
             runtime_pedigree_db[bamei] = copy.deepcopy(KNOWN_HORSE_PEDIGREE[bamei])
 
@@ -1559,7 +1570,8 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                     if not matched:
                         existing_list.append(new_r)
 
-                runtime_enriched_db[bamei] = existing_list
+                # ★新機能④-1: マージ後に日付の古い順➔最新順（[-1]が確実に直近前走）へソート確定
+                runtime_enriched_db[bamei] = sort_records_chronologically(existing_list)
                 enriched_horse_count += 1
 
         return enriched_horse_count > 0, enriched_horse_count
@@ -1570,12 +1582,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
 def evaluate_pedigree_and_distance_aptitude(
     bamei: str, course_type: str, target_distance: int, track_cond: str, cushion_val: float, expected_pace: str = "M_JIRIKI"
 ) -> tuple[float, float, str, List[str]]:
-    """
-    ★新機能①統合: 『本馬の道悪実績 ＞ 血統』の優先ルール
-    - 血統が道悪巧者でも、本馬自身が同馬場(芝/ダ)の道悪で2戦以上走って好走0回（かつ明確な敗退2回以上）なら、
-      血統ボーナスを完全に相殺して 0.955倍 に割引し『⚠️道悪実績劣勢(ノメり注意・血統相殺)』を付与！
-    - 逆に血統が道悪苦手（ディープ系等）でも、本馬に道悪好走実績があれば減点を免除して加点！
-    """
     ped = get_horse_pedigree_info(bamei)
     sire = ped.get("sire", "")
     bms = ped.get("bms", "")
@@ -1661,7 +1667,6 @@ def evaluate_pedigree_and_distance_aptitude(
     )
     dist_mult *= range_mult
 
-    # ★新機能①: 本馬の道悪実績 ＞ 血統の優先ルール
     heavy_mult = 1.00
     if course_type == "ダ" and track_cond in ["稍", "重", "不"]:
         if proven_heavy_dirt_runs == 0 and proven_heavy_dirt_bad_runs >= 2:
@@ -1678,12 +1683,10 @@ def evaluate_pedigree_and_distance_aptitude(
 
     elif course_type == "芝" and (track_cond in ["稍", "重", "不"] or cushion_val <= 8.9):
         if proven_heavy_turf_runs == 0 and proven_heavy_turf_bad_runs >= 2:
-            # 血統が道悪向きでも本馬自身が道悪で2戦以上完敗していれば血統ボーナスを無効化して割引
             heavy_mult = 0.955 if track_cond in ["重", "不"] else 0.968
             dist_badges.append(f"⚠️道悪実績劣勢(0/{proven_heavy_turf_bad_runs}好走・ノメり注意)")
             notes.append("道悪実績劣勢")
         elif proven_heavy_turf_runs >= 1 and heavy_index <= 0.8:
-            # 血統は道悪苦手でも本馬自身が道悪を克服済みならプラス評価
             heavy_mult = 1.030 if proven_heavy_turf_runs >= 2 else 1.018
             notes.append("☔血統克服・道悪実績◎")
         else:
@@ -2406,8 +2409,6 @@ def auto_detect_track_bias(
     except Exception:
         return "フラット", "中", "manual_required", "⚠️ トラックバイアスは手動で設定してください。"
 
-# ====== main.py [Part 3/3] Part 2のすぐ下に最後まで貼り付け ======
-
 class HorseData(BaseModel):
     wakuban: float
     umaban: float
@@ -2622,7 +2623,7 @@ def fetch_race(race_id: str):
 
                 h_pci, h_pci_type = get_horse_pci_stats(bamei)
                 zenso, agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(bamei)
-                early_3f_sec = estimate_horse_early_3f_speed(bamei)
+                early_3f_sec = estimate_horse_early_3f_speed(bamei, distance)
 
                 auto_cond_code, auto_cond_reason = infer_auto_condition_override(
                     bamei, weight_val, change_val, weight_announced, zenso, power_score, kaisuu
@@ -2715,9 +2716,9 @@ def fetch_race(race_id: str):
         )
 
         elapsed_sec = round(time.time() - start_ts, 1)
-        db_merge_note = f" [5走柱・本馬雨/馬格/初角解析:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB使用 / {elapsed_sec}秒]"
+        db_merge_note = f" [5走柱・時系列ソート＆距離換算テン3F:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB使用 / {elapsed_sec}秒]"
         weight_status = "auto_detected" if any_weight_announced else "manual_required"
-        weight_msg = f"✅ 本馬道悪実績・馬格斤量・初角距離・距離/回り/巻き返し印を自動セットしました。{db_merge_note}"
+        weight_msg = f"✅ 本馬道悪実績・馬格斤量・初角距離・距離換算テン3Fを自動セットしました。{db_merge_note}"
 
         return {
             "status": "success", "race_name": race_name, "place_name": place_name,
@@ -2812,13 +2813,40 @@ def get_time_limit_multiplier(horse_name, course_type, current_distance, expecte
     return round(mult, 3)
 
 
+def apply_soft_cap_multiplier(raw_mult: float) -> float:
+    """
+    ★新機能①: 補正倍率のソフトキャップ関数
+    1.18倍を超える領域（または0.84倍を下回る領域）を tanh 曲線で滑らかに減衰させ、
+    好条件が3つ重なった馬と6つ重なった馬の序列が『1.30倍の壁』で同一に潰れるのを防ぐ（最大約1.40倍まで順序を保って伸縮）。
+    """
+    if raw_mult > 1.18:
+        excess = raw_mult - 1.18
+        return 1.18 + 0.22 * math.tanh(excess / 0.22)
+    if raw_mult < 0.84:
+        deficit = 0.84 - raw_mult
+        return 0.84 - 0.12 * math.tanh(deficit / 0.12)
+    return raw_mult
+
+
 def calculate_stage1_pure_score(
-    raw_lgb_pred_neutral: float, horse: HorseData, power_score: float, time_diff_base: float, stage1_ped_mult: float = 1.0
+    raw_lgb_pred_neutral: float,
+    horse: HorseData,
+    power_score: float,
+    time_diff_base: float,
+    stage1_ped_mult: float = 1.0,
+    odds_available: bool = True
 ) -> float:
-    market_prob = min(0.55, 0.80 / float(horse.odds)) if horse.odds > 1.0 else 0.08
+    """
+    ★新機能④-2: オッズ未発売時（odds_available=False）は市場確率の重み（18%）を
+    LightGBM予測値と地力スコア（power_score）へ自動再配分し、オッズ発売前でも明確な指数差を算出する。
+    """
     agari_factor = 1.035 if time_diff_base <= -0.3 else (1.015 if time_diff_base <= 0.0 else (0.965 if time_diff_base >= 0.6 else 1.0))
-    pure_ability = ((raw_lgb_pred_neutral * 0.36) + (power_score * 0.46) + (market_prob * 0.18)) * agari_factor * stage1_ped_mult
-    return float(pure_ability)
+    if odds_available and horse.odds > 1.0:
+        market_prob = min(0.55, 0.80 / float(horse.odds))
+        base_s1 = (raw_lgb_pred_neutral * 0.36) + (power_score * 0.46) + (market_prob * 0.18)
+    else:
+        base_s1 = (raw_lgb_pred_neutral * 0.44) + (power_score * 0.56)
+    return float(base_s1 * agari_factor * stage1_ped_mult)
 
 
 def calculate_comprehensive_score(
@@ -2828,13 +2856,20 @@ def calculate_comprehensive_score(
     training_mult: float = 1.0, stage1_rank: int = 99, total_horses: int = 16,
     track_condition: str = "良", course_type: str = "芝", tactical_mult: float = 1.0,
     gear_mult: float = 1.0, jockey_mult: float = 1.0, course_turn_mult: float = 1.0,
-    rebound_mult: float = 1.0, physique_mult: float = 1.0, distance: int = 2000
+    rebound_mult: float = 1.0, physique_mult: float = 1.0, distance: int = 2000,
+    odds_available: bool = True
 ):
-    market_prob = min(0.55, 0.80 / float(horse.odds)) if horse.odds > 1.0 else 0.08
-    if expected_pace in ["M_JIRIKI", "M"]:
-        base_ability = (raw_lgb_pred * 0.38) + (power_score * 0.42) + (market_prob * 0.20)
+    if odds_available and horse.odds > 1.0:
+        market_prob = min(0.55, 0.80 / float(horse.odds))
+        if expected_pace in ["M_JIRIKI", "M"]:
+            base_ability = (raw_lgb_pred * 0.38) + (power_score * 0.42) + (market_prob * 0.20)
+        else:
+            base_ability = (raw_lgb_pred * 0.42) + (power_score * 0.38) + (market_prob * 0.20)
     else:
-        base_ability = (raw_lgb_pred * 0.42) + (power_score * 0.38) + (market_prob * 0.20)
+        if expected_pace in ["M_JIRIKI", "M"]:
+            base_ability = (raw_lgb_pred * 0.47) + (power_score * 0.53)
+        else:
+            base_ability = (raw_lgb_pred * 0.52) + (power_score * 0.48)
 
     kyaku = int(round(horse.kyakushitsu))
     waku = horse.wakuban
@@ -2971,9 +3006,11 @@ def calculate_comprehensive_score(
         * jockey_mult
         * course_turn_mult
     )
-    capped_mult = max(0.75, min(1.30, total_mult))
 
-    return base_ability * capped_mult, round(bias_mult, 3), round(pace_mult, 3), round(combined_cond_mult, 3)
+    # ★新機能①: 1.30倍の一律ハードカットではなくソフトキャップを適用
+    soft_capped_mult = apply_soft_cap_multiplier(total_mult)
+
+    return base_ability * soft_capped_mult, round(bias_mult, 3), round(pace_mult, 3), round(combined_cond_mult, 3)
 
 
 def build_betting_recommendations(horses_data: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3287,7 +3324,11 @@ def diagnose_race(request: RaceRequest):
     total_horses_cnt = len(request.horses)
 
     valid_odds_h = [h for h in request.horses if h.odds > 1.0]
-    fav5 = sorted(valid_odds_h, key=lambda x: x.odds)[:5] if len(valid_odds_h) >= 5 else request.horses[:5]
+    # ★新機能④-2: オッズにばらつきがあるか（発売済みか、全員初期値10.0倍か）を自動検知
+    odds_values_check = [float(h.odds) for h in valid_odds_h]
+    odds_available = (len(odds_values_check) >= 2 and float(np.std(odds_values_check)) > 0.35)
+
+    fav5 = sorted(valid_odds_h, key=lambda x: x.odds)[:5] if (odds_available and len(valid_odds_h) >= 5) else request.horses[:5]
     fav_closer_skew = sum(1 for h in fav5 if int(round(h.kyakushitsu)) >= 3) >= 4
 
     temp_items = []
@@ -3296,7 +3337,7 @@ def diagnose_race(request: RaceRequest):
     for horse in request.horses:
         h_stats = horse_history_db.get(horse.bamei, {})
         zenso, real_agari, kaisuu, power_score, makuri_flag = get_horse_real_stats(horse.bamei)
-        early_3f_sec = estimate_horse_early_3f_speed(horse.bamei)
+        early_3f_sec = estimate_horse_early_3f_speed(horse.bamei, request.distance)
         effective_zenso_for_lgb = min(zenso, 5.0) if power_score >= 0.77 else zenso
 
         all_horses_early_info.append({
@@ -3359,7 +3400,7 @@ def diagnose_race(request: RaceRequest):
         }])
         raw_pred_stage1 = float(model.predict(stage1_input)[0])
         stage1_prob = calculate_stage1_pure_score(
-            raw_pred_stage1, horse, power_score, time_diff_base, s1_ped_mult
+            raw_pred_stage1, horse, power_score, time_diff_base, s1_ped_mult, odds_available=odds_available
         )
 
         input_data = pd.DataFrame([{
@@ -3419,7 +3460,7 @@ def diagnose_race(request: RaceRequest):
             tactical_mult=tactical_mult, gear_mult=item["gear_mult"],
             jockey_mult=item["jockey_mult"], course_turn_mult=item["course_turn_mult"],
             rebound_mult=item["rebound_mult"], physique_mult=item["physique_mult"],
-            distance=request.distance
+            distance=request.distance, odds_available=odds_available
         )
 
         all_badges: List[str] = list(tactical_badges)
@@ -3458,20 +3499,25 @@ def diagnose_race(request: RaceRequest):
     probs = [h["base_prob"] for h in horses_data]
     mean_prob = np.mean(probs) if probs else 0
     std_prob = np.std(probs) if probs else 1
-    total_prob = sum(probs) if sum(probs) > 0 else 1.0
 
     for h in horses_data:
         shisu = ((h["base_prob"] - mean_prob) / std_prob) * 10 + 50 if std_prob > 0 else 50.0
         h["shisu"] = round(float(shisu), 1)
         h["shisu_diff"] = round(h["shisu"] - h["stage1_shisu"], 1)
-        h["norm_win_prob"] = round(float(h["base_prob"] / total_prob), 4)
+
+    # ★新機能②: 温度付きソフトマックスによるリアルな勝率変換 ＆ シグモイド足切り付き妙味指数
+    exp_scores = [math.exp((h["shisu"] - 50.0) / 6.5) for h in horses_data]
+    sum_exp = sum(exp_scores) if sum(exp_scores) > 0 else 1.0
+    for h, exp_s in zip(horses_data, exp_scores):
+        h["norm_win_prob"] = round(float(exp_s / sum_exp), 4)
 
     myoumi_values = []
     for h in horses_data:
-        if h["odds"] > 0:
-            effective_odds = min(float(h["odds"]), 35.0)
-            ability_weight = 1.0 if h["shisu"] >= 45.0 else 0.5
-            ev = h["norm_win_prob"] * effective_odds * ability_weight
+        if h["odds"] > 0 and odds_available:
+            effective_odds = math.pow(min(float(h["odds"]), 45.0), 0.85)
+            # 指数48未満の単なる大穴がオッズ倍率だけで浮上しないよう滑らかなシグモイド重みを適用
+            ability_gate = 1.0 / (1.0 + math.exp(-(h["shisu"] - 48.5) / 2.2))
+            ev = h["norm_win_prob"] * effective_odds * ability_gate
             h["raw_ev"] = ev
             myoumi_values.append(ev)
         else:
@@ -3481,14 +3527,14 @@ def diagnose_race(request: RaceRequest):
         m_mean = np.mean(myoumi_values)
         m_std = np.std(myoumi_values)
         for h in horses_data:
-            if h["odds"] > 0:
+            if h["odds"] > 0 and odds_available:
                 m_shisu = ((h["raw_ev"] - m_mean) / m_std) * 10 + 50 if m_std > 0 else 50.0
                 h["myoumi"] = round(float(m_shisu), 1)
             else:
-                h["myoumi"] = 0.0
+                h["myoumi"] = 50.0
     else:
         for h in horses_data:
-            h["myoumi"] = 0.0
+            h["myoumi"] = 50.0
 
     horses_data.sort(key=lambda x: x["shisu"], reverse=True)
     for idx, h in enumerate(horses_data):
