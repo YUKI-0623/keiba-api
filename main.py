@@ -1,4 +1,4 @@
-# ====== main.py [Part 1/3] 先頭から貼り付け ======
+# ====== main.py [Part 1/3] 先頭から貼り付け（構文エラー修正済） ======
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -269,10 +269,6 @@ def parse_date_str(d_str: str) -> Optional[datetime]:
 
 
 def sort_records_chronologically(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    ★新機能④-1: 過去走レコードを日付の昇順（古い順 ➔ 最新走が末尾 [-1]）に確実にソートする。
-    日付がないレコードは元の順序を保ったまま先頭側に配置する。
-    """
     if not records or len(records) <= 1:
         return records
     indexed = []
@@ -430,10 +426,6 @@ def calc_single_pci(course_str, time_val, up_val):
 
 
 def estimate_horse_early_3f_speed(bamei_str: str, target_distance: int = 2000) -> float:
-    """
-    ★新機能③: 過去走の距離（1200m〜3000m）と今回の出走距離（target_distance）のペース差を換算し、
-    前走短距離の差し馬と前走長距離の逃げ馬が同じ土俵（今回の距離基準）で正確にテン3F比較できるように補正。
-    """
     records = get_active_horse_records(bamei_str)[-5:]
     if not records:
         return 35.8
@@ -455,9 +447,7 @@ def estimate_horse_early_3f_speed(bamei_str: str, target_distance: int = 2000) -
                 continue
 
             base_first_3f = ((sec - up) / (dist - 600.0)) * 600.0
-
-            # 過去走距離と今回距離のベースラップ差を補正（100mあたり約0.11秒の道中ペース差）
-            dist_diff_ offset = np.clip((target_distance - dist) * 0.0011, -0.85, 0.85)
+            dist_diff_offset = np.clip((target_distance - dist) * 0.0011, -0.85, 0.85)
 
             passing = str(r.get('passing', ''))
             first_corner = 6
@@ -466,7 +456,6 @@ def estimate_horse_early_3f_speed(bamei_str: str, target_distance: int = 2000) -
                 if p_nums:
                     first_corner = p_nums[0]
 
-            # 1角1〜2番手通過の先行力ボーナスと後方通過の位置補正
             if first_corner <= 2:
                 pos_adj = -0.28
             elif first_corner <= 4:
@@ -850,6 +839,7 @@ def evaluate_lap_gear_aptitude(
     return gear_mult, gear_label
 
 # ====== ここまで main.py [Part 1/3] ======
+
 # ====== main.py [Part 2/3] Part 1のすぐ下に貼り付け ======
 
 def evaluate_box_in_and_lead_risk(
