@@ -1,3 +1,4 @@
+# ====== main.py [Part 1/3] 先頭から貼り付け ======
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -847,6 +848,9 @@ def evaluate_lap_gear_aptitude(
             gear_label = "🔥L4F持続ロンスパ◎"
 
     return gear_mult, gear_label
+
+# ====== ここまで main.py [Part 1/3] ======
+# ====== main.py [Part 2/3] Part 1のすぐ下に貼り付け ======
 
 def evaluate_box_in_and_lead_risk(
     wakuban_val: float,
@@ -2409,6 +2413,9 @@ def auto_detect_track_bias(
     except Exception:
         return "フラット", "中", "manual_required", "⚠️ トラックバイアスは手動で設定してください。"
 
+# ====== ここまで main.py [Part 2/3] ======
+# ====== main.py [Part 3/3] Part 2のすぐ下に最後まで貼り付け ======
+
 class HorseData(BaseModel):
     wakuban: float
     umaban: float
@@ -3592,3 +3599,4 @@ def simulate_race(request: RaceRequest):
         "pace_f": diag_res.get("pace_f", 35.0),
         "pace_l": diag_res.get("pace_l", 35.0)
     }
+# ====== ここまで main.py [Part 3/3 (最終行)] ======
