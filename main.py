@@ -1,4 +1,4 @@
-# ====== main.py [Part 1/3] 先頭から貼り付け ======
+# ====== main.py [Part 1/3] 先頭から貼り付け（G1誤判定バグ完全修正版） ======
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -14,7 +14,7 @@ import math
 import copy
 from datetime import datetime
 
-app = FastAPI(title="競馬シミュレーションAPI (ベスト距離表示・直接対決・非根幹・前走斤量比・完全統合版)")
+app = FastAPI(title="競馬シミュレーションAPI (正規クラス判定・ベスト距離・直接対決・完全統合版)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -131,7 +131,7 @@ KNOWN_HORSE_PEDIGREE: Dict[str, Dict[str, str]] = {
     "マジョレルブルー": {"sire": "レイデオロ", "bms": "Galileo"},
     "ショウナンハヤナミ": {"sire": "エピファネイア", "bms": "ディープインパクト"},
     "ナリタエスペランサ": {"sire": "キタサンブラック", "bms": "キングカメハメハ"},
-    "キンググローリー": {"sire": "ハービンジャー", "bms": "ディープインパクト"},
+    "キンググローリー": {"stamina": "ハービンジャー", "sire": "ハービンジャー", "bms": "ディープインパクト"},
     "ラージアンサンブル": {"sire": "ルーラーシップ", "bms": "ディープインパクト"},
     "チャリングクロス": {"sire": "サートゥルナーリア", "bms": "キングカメハメハ"},
     "ショウナンガルフ": {"sire": "キズナ", "bms": "キングカメハメハ"},
@@ -323,49 +323,89 @@ def get_expected_standard_time(c_stats: dict, course_type: str, distance: int) -
 
 
 def infer_class_factor(record: dict) -> float:
-    if 'class_factor' in record and record['class_factor'] is not None:
-        try:
-            val = float(record['class_factor'])
-            r_check = str(record.get('race_name', '')) + str(record.get('grade', ''))
-            if any(k in r_check for k in ['G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞', 'ホープフル', '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC', 'エリザベス女王', 'マイルCS']):
-                return max(val, 1.22)
-            if any(k in r_check for k in ['G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞', 'スプリングS', 'ローズS', '紫苑S', 'アルゼンチン', 'オールカマー']):
-                return max(val, 1.12)
-            return val
-        except:
-            pass
+    """
+    ★バグ修正済み:
+    1. 'GII' や 'GIII' が 'GI' に部分一致してG1扱いになるバグを防ぐため、
+       条件戦(3勝/2勝/1勝/未勝利) ➔ GIII(G3) ➔ GII(G2) ➔ GI(G1) の順（かつ単語境界）で厳密に判定！
+    2. race_name 自体に '3勝' や 'GII'・'GIII'・'L' 等が入っている場合はそれを最優先する。
+    """
+    raw_name = str(record.get('race_name', '')).strip()
+    raw_grade = str(record.get('grade', '')).strip()
 
-    r_name = str(record.get('race_name', '')) + " " + str(record.get('grade', ''))
+    # まず race_name 単体で条件戦やL/OP、G3、G2が明記されていれば確定させる
+    if '未勝利' in raw_name or '新馬' in raw_name:
+        return 0.58
+    if '1勝' in raw_name or '500万' in raw_name:
+        return 0.68
+    if '2勝' in raw_name or '1000万' in raw_name:
+        return 0.78
+    if '3勝' in raw_name or '1600万' in raw_name:
+        return 0.88
+
+    if re.search(r'(?:\bGIII\b|\bG3\b)', raw_name):
+        return 1.04
+    if re.search(r'(?:\bGII\b|\bG2\b)', raw_name):
+        return 1.12
+    if re.search(r'(?:\bGI\b|\bG1\b)', raw_name):
+        return 1.22
+    if re.search(r'(?:\bL\b|\bOP\b|\(L\)|\(OP\))', raw_name):
+        return 0.94
+
+    # 次にレース固有名称キーワードで判定（G3 ➔ G2 ➔ G1）
+    g3_keywords = [
+        '共同通信', 'きさらぎ', '京成杯', 'シンザン', 'フェアリー',
+        'クイーンC', '毎日杯', 'フラワーC', 'ファルコン', 'アーリントン', 'ラジオNIKKEI',
+        'レパード', 'ユニコーン', '新潟記念', '小倉記念', '七夕賞', 'エプソム',
+        'みやこS', '武蔵野S', 'デイリー杯', '福島記念', '小倉牝馬', 'チャレンジC', 'ターコイズ'
+    ]
+    g2_keywords = [
+        '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞',
+        'スプリングS', 'ローズS', '紫苑S', 'フローラS', 'チューリップ', '毎日王冠',
+        '京都大賞典', 'オールカマー', '札幌記念', '日経賞', '阪神大賞典', '日経新春',
+        '金鯱賞', '東スポ杯', 'アルゼンチン', 'アイルラン', '府中牝馬', 'スワンS', '富士S'
+    ]
     g1_keywords = [
-        'G1', 'GI', '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞',
+        '優駿', 'ダービー', '皐月賞', '菊花賞', '桜花賞', '秋華賞',
         '天皇賞', '有馬記念', '宝塚記念', 'ジャパンC', 'ジャパンカップ', 'ホープフル',
         '朝日杯', '阪神JF', 'NHKマイル', '安田記念', 'マイルCS', 'スプリンターズ',
         '高松宮記念', 'ヴィクトリア', 'エリザベス女王', '大阪杯', 'フェブラリー', 'チャンピオンズ'
     ]
-    g2_keywords = [
-        'G2', 'GII', '神戸新聞', 'セントライト', '京都新聞', '青葉賞', '弥生賞',
-        'スプリングS', 'ローズS', '紫苑S', 'フローラS', 'チューリップ', '毎日王冠',
-        '京都大賞典', 'オールカマー', '札幌記念', '日経賞', '阪神大賞典', '日経新春', '金鯱賞', '東スポ杯', 'アルゼンチン'
-    ]
-    g3_keywords = [
-        'G3', 'GIII', '共同通信', 'きさらぎ', '京成杯', 'シンザン', 'フェアリー',
-        'クイーンC', '毎日杯', 'フラワーC', 'ファルコン', 'アーリントン', 'ラジオNIKKEI',
-        'レパード', 'ユニコーン', '新潟記念', '小倉記念', '七夕賞', 'エプソム', 'みやこS', '武蔵野S', 'デイリー杯', '福島記念'
-    ]
 
-    for kw in g1_keywords:
-        if kw in r_name: return 1.22
-    for kw in g2_keywords:
-        if kw in r_name: return 1.12
     for kw in g3_keywords:
-        if kw in r_name: return 1.04
+        if kw in raw_name:
+            return 1.04
+    for kw in g2_keywords:
+        if kw in raw_name:
+            return 1.12
+    for kw in g1_keywords:
+        if kw in raw_name:
+            return 1.22
 
-    if '3勝' in r_name or '1600万' in r_name: return 0.88
-    if '2勝' in r_name or '1000万' in r_name: return 0.78
-    if '1勝' in r_name or '500万' in r_name: return 0.68
-    if '未勝利' in r_name or '新馬' in r_name: return 0.58
-    if 'OP' in r_name or 'L' in r_name or 'ステークス' in r_name or '賞' in r_name or '特別' in r_name:
+    # 既存の class_factor フィールドがある場合
+    if 'class_factor' in record and record['class_factor'] is not None:
+        try:
+            return float(record['class_factor'])
+        except:
+            pass
+
+    # 最後に grade フィールドで判定
+    if raw_grade in ['G3', 'GIII']:
+        return 1.04
+    if raw_grade in ['G2', 'GII']:
+        return 1.12
+    if raw_grade in ['G1', 'GI']:
+        return 1.22
+    if raw_grade in ['3勝']:
+        return 0.88
+    if raw_grade in ['2勝']:
+        return 0.78
+    if raw_grade in ['1勝']:
+        return 0.68
+    if raw_grade in ['OP', 'L']:
         return 0.94
+
+    if 'ステークス' in raw_name or '賞' in raw_name or '特別' in raw_name or 'S' in raw_name or 'T' in raw_name:
+        return 0.88
     return 0.72
 
 
@@ -485,11 +525,6 @@ def evaluate_physique_and_load_balance(
     cushion_val: float,
     place_code: str
 ) -> tuple[float, List[str]]:
-    """
-    ★新機能C統合:
-    - 馬格（馬体重）× 斤量負担率 × 馬場・急坂の物理パワー補正
-    - 前走比での斤量増減（-1.5kg以上の恩恵加点 / 小柄〜標準馬格での+1.5kg以上の斤量増負担）を自動判定
-    """
     weight = float(bataijuu_val) if bataijuu_val and bataijuu_val > 350 else 476.0
     kinryou = float(kinryou_val) if kinryou_val and kinryou_val > 45 else 55.0
     try:
@@ -522,7 +557,6 @@ def evaluate_physique_and_load_balance(
             mult *= 1.012
             badges.append(f"💪大型馬・重斤量耐性○({int(weight)}kg)")
 
-    # ★新機能C: 前走比での斤量増減（斤量ショック）チェック
     records = get_active_horse_records(bamei_str)
     if records:
         last_kin = records[-1].get("kinryou")
@@ -546,13 +580,6 @@ def evaluate_physique_and_load_balance(
 def evaluate_distance_range_and_shift(
     bamei_str: str, target_distance: int, stamina_index: float, expected_pace: str
 ) -> tuple[float, List[str], str]:
-    """
-    ★エリザベス女王杯対策 ＆ 新機能B（非根幹距離巧者）＆ 📏ベスト距離レンジ常時算出:
-    1. 過去走のクラス×着差から各馬の『📏適性距離レンジ（ベスト距離）』を算出し常時表示
-    2. 2200m以上のレースで2200m以上の重賞好走実績がある馬（ラフターラインズ・カムニャック・アクアヴァーナル型）を加点し、
-       逆に2000m以下までしか好走実績がなくG1/G2の2000m以上で負けている馬（ジョスラン型）は +200m延長でも微割引を適用
-    3. 今回が非根幹距離（1800m/2200m/2500m等）の際、非根幹距離で好走率が高い馬に『🎯非根幹距離巧者◎』を付与
-    """
     records = get_active_horse_records(bamei_str)
     if not records:
         return 1.000, [], ""
@@ -619,7 +646,6 @@ def evaluate_distance_range_and_shift(
     mult = 1.000
     badges: List[str] = []
 
-    # 📏ベスト距離レンジラベルの作成
     if min_best - 100 <= target_distance <= max_best + 100:
         best_dist_label = f"📏適性:{range_str}(ベスト{peak_dist}m◎)"
     elif target_distance > max_best + 100:
@@ -629,7 +655,6 @@ def evaluate_distance_range_and_shift(
 
     badges.append(best_dist_label)
 
-    # (A) 前走がベスト距離帯から外れて凡走し、今回ベスト距離帯に戻る条件好転
     if last_dist is not None and last_rank >= 4.0:
         was_out_of_range = (last_dist > max_best + 180) or (last_dist < min_best - 180)
         now_in_best_range = (min_best - 100 <= target_distance <= max_best + 100) and (target_distance in good_dists or abs(target_distance - peak_dist) <= 150)
@@ -637,23 +662,19 @@ def evaluate_distance_range_and_shift(
             mult *= 1.030
             badges.append(f"🎯ベスト距離替わり◎({range_str}実績)")
 
-    # (B) 2200m以上の中長距離戦における「実績裏付け vs 未経験距離延長」の精密化
     if target_distance >= 2200:
         if proven_2200_plus_graded:
             mult *= 1.022
             badges.append("🛡️2200m+重賞好走実績◎(スタミナ裏付け)")
         elif max_best <= 2000 and len(all_dists) >= 3:
-            # 最高好走距離が2000m以下で2200m以上が未経験（または好走なし）のケース
             ext_m = target_distance - max_best
             if ext_m >= 400:
                 mult *= 0.960 if stamina_index < 2.2 else 0.978
                 badges.append(f"⚠️距離延長・スタミナ注意(実績〜{max_best}m)")
             elif ext_m >= 200 and (peak_dist <= 1800 or lost_g1_g2_at_2000_plus or stamina_index < 2.0):
-                # ジョスラン型（1800mベスト・G1の2000mで4着敗退・2200m未経験）の過信防止
                 mult *= 0.978
                 badges.append(f"⚠️距離長め注意(ベスト{peak_dist}m・2200m+未実証)")
     else:
-        # 2000m以下のレースでの一般的な距離短縮・延長判定
         if target_distance < min_best - 200 and avg_best >= 2100:
             if expected_pace not in ["H_MAEKUZURE", "H"]:
                 mult *= 0.970
@@ -663,7 +684,6 @@ def evaluate_distance_range_and_shift(
                 mult *= 0.965
                 badges.append(f"⚠️距離延長・スタミナ注意(実績〜{max_best}m)")
 
-    # (C) ★新機能B: 非根幹距離（1800m・2200m・2500m等）巧者の判定
     total_good = non_core_good_cnt + core_good_cnt
     if (target_distance % 400 != 0) and non_core_good_cnt >= 2 and total_good >= 2:
         if (non_core_good_cnt / float(total_good)) >= 0.65:
@@ -772,12 +792,6 @@ def evaluate_rebound_and_class_transition(
     cushion_val: float = 9.5,
     expected_pace: str = "M_JIRIKI"
 ) -> tuple[float, List[str]]:
-    """
-    ★新機能D統合:
-    - 前走敗退からの巻き返し特注（良馬場替わり・スロー脚余し・ハイペース先行潰れ・重賞僅差）
-    - 昇級初戦辛勝の過剰人気注意
-    - ★新機能D: 前走ドスロー（PCI>=52.3）で4角2番手以内から上がり4位以下で粘り込んだだけの馬が、今回ミドル〜ハイペースに入る場合の『⚠️前走スロー前恵まれ注意』
-    """
     records = get_active_horse_records(bamei_str)
     if not records:
         return 1.000, []
@@ -828,12 +842,10 @@ def evaluate_rebound_and_class_transition(
             mult *= 1.025
             badges.append("🛡️前走重賞僅差・巻き返し圏内◎")
     else:
-        # 前走1〜3着に好走しているが、展開・クラスに死角があるケース
         if last_rk == 1.0 and last_cf <= 0.78 and last_mg <= 0.10 and 0 < odds_val <= 5.5:
             mult *= 0.978
             badges.append("⚠️昇級初戦・前走辛勝(過信禁物)")
 
-        # ★新機能D: 前走ドスローの逃げ・2番手恵まれ（上がり順位4位以下）が今回ミドル〜ハイペースに入る場合
         if last_pci is not None and last_pci >= 52.3 and last_4c <= 2 and last_ag_rk >= 4:
             if expected_pace not in ["S_YOIDON", "S"] and last_cf <= 1.12:
                 mult *= 0.978
@@ -843,11 +855,6 @@ def evaluate_rebound_and_class_transition(
 
 
 def evaluate_direct_matchups(bamei_list: List[str]) -> Dict[str, tuple[float, str]]:
-    """
-    ★新機能A: 出走メンバー間の近走『直接対決（同一日付・同一コースのレース）』を自動照合！
-    - 同じレースを走って明確に先着（勝ち馬が4着以内かつ着差0.1秒以上または2着順以上先着）している場合、
-      先着した馬に『🤝直接対決先着優位◎(対○○)』を付与し、前走負かした相手に理由なく逆転されるのを防ぐ。
-    """
     result_map: Dict[str, tuple[float, str]] = {b: (1.000, "") for b in bamei_list}
     race_buckets: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -904,7 +911,7 @@ def evaluate_direct_matchups(bamei_list: List[str]) -> Dict[str, tuple[float, st
     return result_map
 
 # ====== ここまで main.py [Part 1/3] ======
-# ====== main.py [Part 2/3] Part 1のすぐ下に貼り付け ======
+# ====== main.py [Part 2/3] Part 1のすぐ下に貼り付け（表記・クラス判定修正版） ======
 
 def evaluate_lap_gear_aptitude(
     bamei_str: str,
@@ -1186,6 +1193,32 @@ def evaluate_jockey_stage_synergy(
     return round(mult, 3), label
 
 
+def format_clean_race_And_grade(raw_rname: str, grade_s: str, default_label: str) -> str:
+    """
+    ★表記正規化関数:
+    - raw_rname に既に 'GIII', 'GII', 'GI', 'G1', 'G2', 'G3', 'L', 'OP', '3勝', '2勝', '1勝', '未勝利', '新馬'
+      などが含まれている場合は、余計な (G1) や (OP) を絶対に重複付与しない！
+    - 以前のキャッシュで万が一 '3勝(G1)' や 'GII(G1)' が残っていても自動で除去して正規表記に整える。
+    """
+    if not raw_rname:
+        return default_label
+
+    clean_name = re.sub(r'\((?:G1|G2|G3|GI|GII|GIII|OP|L)\)$', '', raw_rname).strip()
+
+    has_embedded_class = bool(
+        re.search(
+            r'(?:\bGIII\b|\bGII\b|\bGI\b|\bG1\b|\bG2\b|\bG3\b|\bL\b|\bOP\b|3勝|2勝|1勝|1600万|1000万|500万|未勝利|新馬)',
+            clean_name
+        )
+    )
+    if has_embedded_class:
+        return clean_name
+
+    if grade_s and grade_s not in clean_name:
+        return f"{clean_name}({grade_s})"
+    return clean_name
+
+
 def build_horse_history_details(bamei_str: str, place_dict: Dict[str, str]) -> List[Dict[str, str]]:
     records = get_active_horse_records(bamei_str)[-5:]
     history_details = []
@@ -1201,11 +1234,9 @@ def build_horse_history_details(bamei_str: str, place_dict: Dict[str, str]) -> L
         raw_rname = str(r.get('race_name', '')).strip()
         grade_s = str(r.get('grade', '')).strip()
         distance_label = f"{place}{c_type}{dist}m({cond_str})"
+        default_display = f"{place} {c_type}{dist}m ({cond_str})"
 
-        if raw_rname:
-            display_race_name = f"{raw_rname}({grade_s})" if (grade_s and grade_s not in raw_rname) else raw_rname
-        else:
-            display_race_name = f"{place} {c_type}{dist}m ({cond_str})"
+        display_race_name = format_clean_race_And_grade(raw_rname, grade_s, default_display)
 
         single_pci = calc_single_pci(course_raw, r.get('time', ''), r.get('up', ''))
         rank_num = r.get('rank', 99)
@@ -1632,20 +1663,31 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                 if rank_val is None:
                     continue
 
-                grade_str = ""
-                if "Icon_GradeType1" in p_html or "(GI)" in p_text or "(G1)" in p_text or "GI" in p_text:
-                    grade_str = "G1"
-                elif "Icon_GradeType2" in p_html or "(GII)" in p_text or "(G2)" in p_text or "GII" in p_text:
-                    grade_str = "G2"
-                elif "Icon_GradeType3" in p_html or "(GIII)" in p_text or "(G3)" in p_text or "GIII" in p_text:
-                    grade_str = "G3"
-                elif "Icon_GradeType4" in p_html or "Icon_GradeType5" in p_html or "(L)" in p_text or "(OP)" in p_text:
-                    grade_str = "OP"
-
                 race_title = ""
                 m_rname = re.search(r'<div[^>]*class="[^"]*Data02[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
                 if m_rname:
-                    race_title = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', '', m_rname.group(1)).strip())
+                    race_title = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', m_rname.group(1)).strip())
+
+                # ★バグ修正: Icon_GradeType10 等が Icon_GradeType1 に前方一致しないよう \b 境界を使用し、
+                # さらに GIII ➔ GII ➔ GI ➔ 条件戦の順で厳密にグレードを判定する
+                grade_str = ""
+                check_str = f"{race_title} {p_text}"
+                if "3勝" in check_str or "1600万" in check_str:
+                    grade_str = "3勝"
+                elif "2勝" in check_str or "1000万" in check_str:
+                    grade_str = "2勝"
+                elif "1勝" in check_str or "500万" in check_str:
+                    grade_str = "1勝"
+                elif "未勝利" in check_str or "新馬" in check_str:
+                    grade_str = "未勝利"
+                elif re.search(r'\bIcon_GradeType3\b', p_html) or re.search(r'(?:\bGIII\b|\bG3\b|\(GIII\)|\(G3\))', check_str):
+                    grade_str = "G3"
+                elif re.search(r'\bIcon_GradeType2\b', p_html) or re.search(r'(?:\bGII\b|\bG2\b|\(GII\)|\(G2\))', check_str):
+                    grade_str = "G2"
+                elif re.search(r'\bIcon_GradeType1\b', p_html) or re.search(r'(?:\bGI\b|\bG1\b|\(GI\)|\(G1\))', check_str):
+                    grade_str = "G1"
+                elif re.search(r'\bIcon_GradeType(?:4|5)\b', p_html) or re.search(r'(?:\bL\b|\bOP\b|\(L\)|\(OP\))', check_str):
+                    grade_str = "OP"
 
                 c_type, dist_val, time_str, cond_str = "芝", 2000, "-", "良"
                 m_cd = re.search(r'(芝|ダ|障)\s*(\d{3,4})', p_text)
@@ -1695,7 +1737,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                 if m_wt:
                     w_val = float(m_wt.group(1))
 
-                # ★新機能C連動: 5走柱のData03/Data05またはテキストから過去走の斤量を抽出
                 kinryou_past = None
                 m_kin = re.search(r'\b(4[8-9](?:\.[05])?|5[0-9](?:\.[05])?|6[0-2](?:\.[05])?)\b', p_text)
                 if m_kin:
@@ -1733,7 +1774,8 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                         if (same_time and same_course) or (same_course and same_rank and new_r["up"] == str(ex_r.get("up", ""))):
                             if new_r["date"]: ex_r["date"] = new_r["date"]
                             if new_r["margin"] is not None: ex_r["margin"] = new_r["margin"]
-                            if new_r["grade"]: ex_r["grade"] = new_r["grade"]
+                            # 最新の正確なgradeで確実に上書き（古い誤判定G1を消去）
+                            ex_r["grade"] = new_r["grade"]
                             if new_r["race_name"]: ex_r["race_name"] = new_r["race_name"]
                             if new_r["passing"] != "-": ex_r["passing"] = new_r["passing"]
                             if new_r["agari_rank"] <= 3: ex_r["agari_rank"] = new_r["agari_rank"]
@@ -1755,13 +1797,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
 def evaluate_pedigree_and_distance_aptitude(
     bamei: str, course_type: str, target_distance: int, track_cond: str, cushion_val: float, expected_pace: str = "M_JIRIKI"
 ) -> tuple[float, float, str, List[str]]:
-    """
-    ★エリザベス女王杯対策統合:
-    - 『本馬の距離実績 ＞ 血統スタミナ』の優先制御：
-      2200m以上のレースにおいて、3戦以上走って最高好走距離が2000m以下の馬（2200m+未実証）は、
-      血統が長距離向きでも血統スタミナボーナスを半分以下（最大1.010倍）に抑制し、
-      逆に2200m以上で好走実績がある馬にのみフルボーナスを与える。
-    """
     ped = get_horse_pedigree_info(bamei)
     sire = ped.get("sire", "")
     bms = ped.get("bms", "")
@@ -1826,7 +1861,6 @@ def evaluate_pedigree_and_distance_aptitude(
                 dist_mult *= 1.032 if target_distance >= 2500 else 1.022
                 notes.append("中長距離血統◎")
             else:
-                # 2200m以上が未実証の馬は血統ボーナスを最小限（1.008倍）に抑える
                 dist_mult *= 1.008
                 notes.append("血統長め可も2200m+課題")
         elif stamina_index >= 2.0:
@@ -1908,12 +1942,6 @@ def evaluate_pedigree_and_distance_aptitude(
 def evaluate_rotation_aptitude(
     bamei: str, target_race_date: Optional[datetime], power_score: float, target_distance: int
 ) -> tuple[float, str]:
-    """
-    ★エリザベス女王杯対策（③ G1/G2好走馬の直行ローテ減点免除）:
-    過去にG1/G2で3着以内（または0.35秒差以内）の実績がある馬は、
-    半年ぶり（150日以上）や休み明け（70〜149日）の直行ローテでも減点せず、
-    現代トレンドの『🛡️G1/重賞実績馬・直行仕上げ○』としてプラス評価する。
-    """
     records = get_active_horse_records(bamei)
     if not records:
         return 1.00, "初出走/履歴なし"
@@ -2930,9 +2958,9 @@ def fetch_race(race_id: str):
         )
 
         elapsed_sec = round(time.time() - start_ts, 1)
-        db_merge_note = f" [5走柱・ベスト距離/直接対決/非根幹/斤量比:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB使用 / {elapsed_sec}秒]"
+        db_merge_note = f" [5走柱・正規クラス判定/ベスト距離/直接対決:{merged_cnt}頭 / 取得{elapsed_sec}秒]" if past_merged_ok else f" [サーバーDB使用 / {elapsed_sec}秒]"
         weight_status = "auto_detected" if any_weight_announced else "manual_required"
-        weight_msg = f"✅ 📏ベスト距離レンジ・🤝直接対決・🎯非根幹距離・🪶前走斤量比を自動セットしました。{db_merge_note}"
+        weight_msg = f"✅ 📏ベスト距離レンジ・🤝直接対決・🎯非根幹距離・🪶前走斤量比・正規クラスを自動セットしました。{db_merge_note}"
 
         return {
             "status": "success", "race_name": race_name, "place_name": place_name,
