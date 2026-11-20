@@ -939,7 +939,7 @@ def evaluate_direct_matchups(bamei_list: List[str]) -> Dict[str, tuple[float, st
     return result_map
 
 # ====== ここまで main.py [Part 1/3] ======
-# ====== main.py [Part 2/3] Part 1のすぐ下に貼り付け（10項目総点検・完全修正版） ======
+# ====== main.py [Part 2/3] Part 1のすぐ下に貼り付け（前年実績探索強化・10項目総点検統合版） ======
 
 def evaluate_lap_gear_aptitude(
     bamei_str: str,
@@ -1124,7 +1124,7 @@ def evaluate_box_in_and_lead_risk(
             else:
                 badges.append("🔥好位セーフティリード◎")
 
-        # ⑦ 相対斤量（平均比 -1.0kg以下）の軽斤量好位馬のみ警戒加点
+        # 相対斤量（平均比 -1.0kg以下）の軽斤量好位馬のみ警戒加点
         if distance >= 2000 and (kinryou - avg_kinryou) <= -1.0 and odds >= 6.0:
             tactical_mult *= 1.016
             if "🔥前残り警戒穴(人気馬後方牽制)" not in badges:
@@ -1334,9 +1334,11 @@ def is_same_race_series(target_clean: str, cand_clean: str) -> bool:
     def _canon(name: str) -> str:
         return (
             name.replace('チャンピオンシップ', 'CS')
+            .replace('チャンピオンS', 'CS')
             .replace('チャンピオンズC', 'チャンピオンズ')
             .replace('ステークス', 'S')
             .replace('カップ', 'C')
+            .replace('トロフィー', 'T')
             .replace('記念', '')
             .replace('賞', '')
         )
@@ -1365,7 +1367,13 @@ def extract_html_race_metadata(html_text: str) -> tuple[str, Optional[str], Opti
     clean_title = normalize_race_title(title_str)
     c_type = None
     dist_val = None
-    m_td = re.search(r'(芝|ダート|ダ|障害|障)\s*(?:右|左|直|外|内|\s|・)*?(\d{3,4})\s*m', html_text)
+
+    m_rd1 = re.search(r'<div[^>]*class="[^"]*RaceData01[^"]*"[^>]*>(.*?)</div>', html_text, re.IGNORECASE | re.DOTALL)
+    rd1_text = re.sub(r'<[^>]*>', ' ', m_rd1.group(1)) if m_rd1 else html_text
+
+    m_td = re.search(r'(芝|ダート|ダ|障害|障)\s*(?:右|左|直|外|内|\s|・)*?(\d{3,4})\s*m', rd1_text)
+    if not m_td and rd1_text != html_text:
+        m_td = re.search(r'(芝|ダート|ダ|障害|障)\s*(?:右|左|直|外|内|\s|・)*?(\d{3,4})\s*m', html_text)
     if m_td:
         raw_t = m_td.group(1)
         c_type = 'ダ' if raw_t in ['ダート', 'ダ'] else ('障' if raw_t in ['障害', '障'] else '芝')
@@ -1518,7 +1526,7 @@ def fetch_reference_race_benchmarks(
             strict_validation=False
         )
 
-    if len(race_id) == 12 and race_id.isdigit() and (start_ts == 0.0 or (time.time() - start_ts) < 12.5):
+    if len(race_id) == 12 and race_id.isdigit() and (start_ts == 0.0 or (time.time() - start_ts) < 13.5):
         prev_year = int(race_id[:4]) - 1
         place_code = race_id[4:6]
         kai_num = int(race_id[6:8])
@@ -1531,38 +1539,36 @@ def fetch_reference_race_benchmarks(
             if cid and cid not in cand_ids:
                 cand_ids.append(cid)
 
-        _add_cand(f"{prev_year}{place_code}{kai_num:02d}{day_num:02d}{r_num:02d}")
-        for k_diff in [-1, 1]:
-            adj_kai = kai_num + k_diff
-            if 1 <= adj_kai <= 6:
-                _add_cand(f"{prev_year}{place_code}{adj_kai:02d}{day_num:02d}{r_num:02d}")
-
-        for k_diff in [0, -1, 1]:
-            adj_kai = kai_num + k_diff
-            if 1 <= adj_kai <= 6:
-                for d_diff in [-1, 1, -2, 2]:
-                    adj_day = day_num + d_diff
-                    if 1 <= adj_day <= 12:
-                        _add_cand(f"{prev_year}{place_code}{adj_kai:02d}{adj_day:02d}{r_num:02d}")
-
-        if start_ts == 0.0 or (time.time() - start_ts) < 10.0:
+        # 1. 最優先: data_list.html にある前年・同場・同Rの確定IDを先頭に配置
+        if start_ts == 0.0 or (time.time() - start_ts) < 10.5:
             data_html = cached_get_html(
                 f"https://race.netkeiba.com/race/data_list.html?race_id={race_id}",
                 headers, timeout=2.5
             )
             if data_html:
                 found_ids = re.findall(rf'\b({prev_year}\d{{8}})\b', data_html)
+                exact_r_ids = [fid for fid in found_ids if fid[4:6] == place_code and int(fid[10:12]) == r_num]
                 same_place_ids = [fid for fid in found_ids if fid[4:6] == place_code]
                 other_place_ids = [fid for fid in found_ids if fid[4:6] != place_code]
-                for fid in same_place_ids + other_place_ids:
+                for fid in exact_r_ids + same_place_ids + other_place_ids:
                     _add_cand(fid)
 
-        for cid in cand_ids[:8]:
-            if start_ts > 0.0 and (time.time() - start_ts) > 13.5:
+        # 2. 規則生成: 土日開催の週ズレ（±2日・±4日）と開催回ズレ（±1回）を優先順で探索
+        for d_diff in [0, 2, -2, 1, -1, 4, -4, 3, -3]:
+            adj_day = day_num + d_diff
+            if not (1 <= adj_day <= 12):
+                continue
+            for k_diff in [0, -1, 1]:
+                adj_kai = kai_num + k_diff
+                if 1 <= adj_kai <= 6:
+                    _add_cand(f"{prev_year}{place_code}{adj_kai:02d}{adj_day:02d}{r_num:02d}")
+
+        for cid in cand_ids[:14]:
+            if start_ts > 0.0 and (time.time() - start_ts) > 15.0:
                 break
             p_html = cached_get_html(
                 f"https://race.netkeiba.com/race/result.html?race_id={cid}",
-                headers, timeout=2.2
+                headers, timeout=2.0
             )
             if p_html:
                 parsed_p = parse_race_result_benchmark_from_html(
@@ -1656,20 +1662,11 @@ def extract_pedigree_from_row(row_html: str, bamei: str) -> Dict[str, str]:
 
 
 def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[str]) -> tuple[bool, int]:
-    """
-    ★総点検修正:
-    - ① 着差は Data07（勝ち馬・着差セル）から抽出し 0.0〜15.0秒のみ許可（Data06の上り3F混入を完全排除）
-    - ⑥ 上がり順位は Data06 内のHTMLのみに限定（着順ハイライト誤爆を排除）
-    - ⑧ 前走斤量は Data03/Data04 内の小数付き斤量（例: 56.0）を優先抽出
-    - ⑨ 日付突合は normalize_date_str で YYYY/MM/DD に統一し重複登録を防止
-    - ⑩ クラス判定は ASCII 境界（(?<![A-Za-z0-9])）で日本語密着ケースにも対応
-    """
     place_map_rev = {'札幌':'01', '函館':'02', '福島':'03', '新潟':'04', '東京':'05', '中山':'06', '中京':'07', '京都':'08', '阪神':'09', '小倉':'10'}
     enriched_horse_count = 0
 
     for bamei in bamei_list:
         base_recs = copy.deepcopy(horse_history_db.get(bamei, {}).get('race_records', []))
-        # 既存DBに万が一異常な着差が残っていれば安全にクリア
         for r in base_recs:
             if r.get("margin") is not None:
                 try:
@@ -1815,7 +1812,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                 if m_pass:
                     passing_str = m_pass.group(1)
 
-                # Data06（通過順・上り3F・馬体重）と Data07（勝ち馬・着差）を明確に分離
                 m_data06 = re.search(r'<div[^>]*class="[^"]*Data06[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
                 d6_html = m_data06.group(1) if m_data06 else ""
                 d6_txt = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', d6_html)).strip() if d6_html else ""
@@ -1834,7 +1830,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                         up_val = m_cand.group(1)
                         break
 
-                # ⑥ 上がり順位は Data06 内のHTMLのみを対象とし、着順ハイライト誤爆を完全に防止
                 agari_rank = 99
                 if place_code != "99" and d6_html:
                     if re.search(r'class="[^"]*(?:Rank_1|BgYellow)[^"]*"', d6_html, re.IGNORECASE):
@@ -1844,7 +1839,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                     elif re.search(r'class="[^"]*(?:Rank_3|BgBlue)[^"]*"', d6_html, re.IGNORECASE):
                         agari_rank = 3
 
-                # ① 着差は Data07 のみから取得し、0.0〜15.0秒の範囲チェックで上り3F混入を完全防止
                 margin_val = 0.0 if rank_val == 1.0 else None
                 if margin_val is None and d7_txt:
                     m_mg = re.search(r'\(\s*([+-]?\d+\.\d+)\s*\)', d7_txt)
@@ -1858,7 +1852,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
                 if m_wt:
                     w_val = float(m_wt.group(1))
 
-                # ⑧ 前走斤量は Data03 / Data04（騎手・斤量セル）のみから安全抽出
                 kinryou_past = None
                 m_d3 = re.search(r'<div[^>]*class="[^"]*Data03[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
                 m_d4 = re.search(r'<div[^>]*class="[^"]*Data04[^"]*"[^>]*>(.*?)</div>', p_html, re.IGNORECASE | re.DOTALL)
@@ -1934,11 +1927,6 @@ def fetch_and_merge_shutuba_past(race_id: str, headers: dict, bamei_list: List[s
 def evaluate_pedigree_and_distance_aptitude(
     bamei: str, course_type: str, target_distance: int, track_cond: str, cushion_val: float, expected_pace: str = "M_JIRIKI"
 ) -> tuple[float, float, str, List[str]]:
-    """
-    ★④・⑤ 二重加点の解消:
-    - 2200m+実績加点は evaluate_distance_range_and_shift 側へ一本化（ここでの重複 1.020 を削除）
-    - 道悪好走実績加点は evaluate_lap_gear_aptitude 側へ一本化（ここでは血統評価＋道悪大敗リスク＋血統克服の減点回避に限定）
-    """
     ped = get_horse_pedigree_info(bamei)
     sire = ped.get("sire", "")
     bms = ped.get("bms", "")
@@ -2018,7 +2006,6 @@ def evaluate_pedigree_and_distance_aptitude(
     )
     dist_mult *= range_mult
 
-    # ⑤ 道悪評価: 実績加点は gear_mult に一本化し、ここは血統適性と道悪大敗リスクに専念
     heavy_mult = 1.00
     if course_type == "ダ" and track_cond in ["稍", "重", "不"]:
         if proven_heavy_dirt_runs == 0 and proven_heavy_dirt_bad_runs >= 2:
@@ -2035,7 +2022,6 @@ def evaluate_pedigree_and_distance_aptitude(
             dist_badges.append(f"⚠️道悪実績劣勢(0/{proven_heavy_turf_bad_runs}好走・ノメり注意)")
             notes.append("道悪実績劣勢")
         elif proven_heavy_turf_runs >= 1 and heavy_index <= 0.8:
-            # 血統的には軽馬場向きでも道悪実績がある馬は減点回避（微加点のみ）
             heavy_mult = 1.010
             notes.append("☔血統克服・道悪対応○")
         else:
@@ -2181,7 +2167,6 @@ def get_horse_pci_stats(bamei_str):
 
 
 def get_horse_real_stats(bamei_str) -> tuple[float, Optional[float], int, float, bool]:
-    """② 有効なJRA上り3Fがない馬（海外馬・地方馬・初出走馬）は固定35.0秒ではなく None を返す"""
     records = get_active_horse_records(bamei_str)
     if not records: return 8.0, None, 0, 0.5, False
 
